@@ -72,5 +72,5 @@ Accuracy: signs exact; log|det| rms error 1e-4 – 1e-3 at n = 128–1024, the s
 
 ## Development
 
-`tests/` holds a compact pytest suite (forward vs float64 NumPy, tiny-n polynomials, gradients vs analytic
+Developer notes live in `AGENTS.md` and `docs/` (kernel status and dead ends, Pallas/Triton gotchas, full development history). `tests/` holds a compact pytest suite (forward vs float64 NumPy, tiny-n polynomials, gradients vs analytic
 references, singular inputs). `benchmarks/bench.py` reproduces the table above.
