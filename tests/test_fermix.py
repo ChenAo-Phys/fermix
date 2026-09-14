@@ -9,7 +9,7 @@ import jax.numpy as jnp
 if not any(d.platform == "gpu" for d in jax.devices()):
     pytest.skip("fermix kernels need a CUDA GPU", allow_module_level=True)
 
-from fermix import det, pf, slogdet, slogpf
+from fermix import FermixFallbackWarning, det, pf, slogdet, slogpf
 
 rng = np.random.default_rng(0)
 
@@ -104,7 +104,7 @@ def test_det_pf_values_batch_dims_and_odd_n():
     assert np.all(np.asarray(s) == 0) and np.all(np.isneginf(np.asarray(l)))
 
 
-def test_rejects_non_fp32():
+def test_rejects_unsupported_dtype():
     with pytest.raises(TypeError):
         slogdet(jnp.eye(4, dtype=jnp.float16))
 
@@ -192,3 +192,58 @@ def test_pf_grad_singular(n):
     scale = max(np.abs(ref).max(), 1e-30)
     assert np.max(np.abs(g - ref)) < 1e-4 * scale
     assert np.all(g[1] == 0) and np.abs(ref[0]).max() > 0
+
+
+# ----------------------------------------------------------------------------- generic fallback (CPU / float64)
+def test_cpu_fallback_warns_and_matches():
+    cpu = jax.devices("cpu")[0]
+    n = 12
+    A = (rng.standard_normal((4, n, n)) + 2 * np.eye(n)).astype(np.float32)
+    A[0, :, 3] = 0.0                                                   # exact zero pivot
+    Ad = jax.device_put(jnp.asarray(A), cpu)
+    with pytest.warns(FermixFallbackWarning):
+        s, l = map(np.asarray, slogdet(Ad))
+    s64, l64 = np.linalg.slogdet(A.astype(np.float64))
+    assert np.array_equal(s, s64) and np.allclose(l[1:], l64[1:], atol=1e-4) and np.isneginf(l[0])
+    with pytest.warns(FermixFallbackWarning), jax.default_device(cpu):
+        g = np.asarray(jax.grad(lambda a: det(a).sum())(Ad))
+    ref = np.stack([adjT64(a) for a in A.astype(np.float64)])
+    assert np.all(np.isfinite(g)) and np.max(np.abs(g - ref)) < 1e-4 * np.abs(ref).max()
+    S = skew(rng.standard_normal((3, n, n))).astype(np.float32)
+    S[0, 2, :] = 0.0; S[0, :, 2] = 0.0
+    Sd = jax.device_put(jnp.asarray(S), cpu)
+    with pytest.warns(FermixFallbackWarning):
+        s, l = map(np.asarray, slogpf(Sd, skew_symmetrize=False))
+    ref = [pf_ref64(S[i]) for i in range(3)]
+    assert np.array_equal(s, [r[0] for r in ref]) and np.allclose(l[1:], [r[1] for r in ref[1:]], atol=1e-4)
+    with pytest.warns(FermixFallbackWarning), jax.default_device(cpu):
+        g = np.asarray(jax.grad(lambda a: pf(a, skew_symmetrize=False).sum())(Sd))
+    ref = np.stack([pf_gradT64(x) for x in S.astype(np.float64)])
+    assert np.all(np.isfinite(g)) and np.max(np.abs(g - ref)) < 1e-4 * np.abs(ref).max()
+    with pytest.warns(FermixFallbackWarning), jax.default_device(cpu):
+        g = np.asarray(jax.grad(lambda a: slogpf(a, skew_symmetrize=False)[1].sum())(Sd))
+    assert np.all(g[0] == 0) and relerr(g[1], 0.5 * np.linalg.inv(S[1].astype(np.float64)).T) < 1e-4
+    # a committed CPU array reaching a traced call without default_device: no warning, but the generic path runs
+    g2 = np.asarray(jax.grad(lambda a: slogpf(a, skew_symmetrize=False)[1].sum())(Sd))
+    assert np.allclose(g2, g, rtol=1e-5, atol=1e-6)
+
+
+def test_float64_fallback():
+    jax.config.update("jax_enable_x64", True)
+    try:
+        n = 20
+        A = rng.standard_normal((3, n, n)) + 2 * np.eye(n)
+        with pytest.warns(FermixFallbackWarning):
+            s, l = slogdet(jnp.asarray(A))
+        assert l.dtype == jnp.float64
+        s64, l64 = np.linalg.slogdet(A)
+        assert np.array_equal(np.asarray(s), s64) and np.allclose(np.asarray(l), l64, atol=1e-10)
+        with pytest.warns(FermixFallbackWarning):
+            g = np.asarray(jax.grad(lambda a: slogdet(a)[1].sum())(jnp.asarray(A)))
+        assert relerr(g, np.swapaxes(np.linalg.inv(A), -1, -2)) < 1e-10
+        S = skew(rng.standard_normal((2, n, n)))
+        with pytest.warns(FermixFallbackWarning):
+            p = np.asarray(pf(jnp.asarray(S)))
+        assert np.allclose(p, [pf64(S[i]) for i in range(2)], rtol=1e-10)
+    finally:
+        jax.config.update("jax_enable_x64", False)

@@ -60,7 +60,10 @@ Accuracy: signs exact; log|det| rms error 1e-4 – 1e-3 at n = 128–1024, the s
 
 ## Notes and limits
 
-- fp32 only (a `TypeError` otherwise); tested on A100 with jax 0.11.1; Hopper tile configs untested.
+- The kernels run for float32 on CUDA GPUs. Any other dtype (float64) or device (CPU, an array committed to a
+  CPU device, a non-CUDA default backend) emits a `FermixFallbackWarning` and uses a generic jax.numpy implementation
+  (LU for det, masked batched Parlett–Reid for pf) with the same outputs and the same singular-safe derivative rules,
+  but far slower. Other dtypes raise `TypeError`. Tested on A100 with jax 0.11.1; Hopper tile configs untested.
 - Memory: the forward needs two (B, n, n) work buffers; the gradient about five more.
 - `det`/`pf` overflow fp32 for large, badly scaled matrices — use `slogdet`/`slogpf` then.
 - Structured singularities such as a zero row/column give exact zero pivots (and the exact zero-gradient / adjugate

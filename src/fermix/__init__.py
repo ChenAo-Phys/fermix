@@ -2,7 +2,7 @@
 
 Public functions: :func:`slogdet`, :func:`slogpf`, :func:`det`, :func:`pf`.
 """
-from .api import det, pf, slogdet, slogpf
+from .api import FermixFallbackWarning, det, pf, slogdet, slogpf
 
 __version__ = "0.1.0"
-__all__ = ["slogdet", "slogpf", "det", "pf", "__version__"]
+__all__ = ["slogdet", "slogpf", "det", "pf", "FermixFallbackWarning", "__version__"]

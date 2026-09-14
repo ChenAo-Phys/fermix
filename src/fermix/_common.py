@@ -1,7 +1,6 @@
 """Shared constants and helpers for the fermix kernels (row-tile layout cost model, dot precision, small
 register-tile triangular inverses, block specs, input preparation and padding)."""
 import jax.numpy as jnp
-import numpy as np
 from jax import lax
 from jax.experimental import pallas as pl
 
@@ -84,17 +83,6 @@ def _full(n):
 
 def _vec(n):
     return pl.BlockSpec((None, n), lambda *idx: (idx[0], 0))
-
-
-def _prep(a):
-    a = jnp.asarray(a)
-    if a.dtype != jnp.float32:
-        raise TypeError(f"fastslog kernels are fp32-only, got {a.dtype}")
-    if a.ndim < 2 or a.shape[-1] != a.shape[-2]:
-        raise ValueError(f"expected (..., n, n), got {a.shape}")
-    batch = a.shape[:-2]
-    n = a.shape[-1]
-    return a.reshape((int(np.prod(batch)), n, n)), batch, n
 
 
 def _embed(A, n, pad_block, b=BLOCK):
