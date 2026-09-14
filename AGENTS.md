@@ -1,7 +1,7 @@
 # fermix — developer / agent guide
 
 Batched fp32 `slogdet` / `slogpf` / `det` / `pf` on CUDA GPUs with Pallas (Triton) kernels, generic XLA fallback
-elsewhere, singular-safe gradients. Read this before touching the kernels; the design notes are in `docs/`.
+elsewhere, singular-safe gradients. Read this before touching the kernels; the internal design notes are in `.agents/notes/` (`docs/` is reserved for the user-facing documentation).
 
 ## Layout
 
@@ -17,9 +17,9 @@ elsewhere, singular-safe gradients. Read this before touching the kernels; the d
 | `src/fermix/_common.py` | constants, row-tile layout cost model, register triangular inverses, padding helpers |
 | `tests/test_fermix.py` | pytest suite (needs a CUDA GPU; ~2 min) |
 | `benchmarks/bench.py` | forward + gradient timings vs `jnp.linalg.slogdet` / `lrux.slogpf` |
-| `docs/kernel-notes.md` | status, performance, design decisions, dead ends, what to try next |
-| `docs/pallas-triton-gotchas.md` | hard-won Pallas/Triton/XLA facts — start any kernel work from these |
-| `docs/development-history.md` | the full development record (origin: `Hubbard_Next_Neighbor_SC/project/fast_linalg/SUMMARY.md`) |
+| `.agents/notes/kernel-notes.md` | status, performance, design decisions, dead ends, what to try next |
+| `.agents/notes/pallas-triton-gotchas.md` | hard-won Pallas/Triton/XLA facts — start any kernel work from these |
+| `.agents/notes/development-history.md` | the full development record (origin: `Hubbard_Next_Neighbor_SC/project/fast_linalg/SUMMARY.md`) |
 
 Origin: the kernels were developed as `Hubbard_Next_Neighbor_SC/project/fast_linalg/fastslog.py` (frozen); develop here.
 
