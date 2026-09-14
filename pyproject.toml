@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fermix"
+version = "0.1.0"
+description = "Fast batched fp32 determinants and Pfaffians on GPU with JAX/Pallas kernels, with singular-safe gradients"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [{ name = "Ao Chen" }]
+keywords = ["jax", "pallas", "determinant", "pfaffian", "gpu", "variational monte carlo"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Physics",
+    "Environment :: GPU :: NVIDIA CUDA",
+]
+dependencies = ["jax>=0.11", "numpy"]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
