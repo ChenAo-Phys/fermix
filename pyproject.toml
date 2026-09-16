@@ -7,7 +7,7 @@ name = "fermix"
 version = "0.1.0"
 description = "Fast batched fp32 determinants and Pfaffians on GPU with JAX/Pallas kernels, with singular-safe gradients"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 license = { file = "LICENSE" }
 authors = [{ name = "Ao Chen" }]
 keywords = ["jax", "pallas", "determinant", "pfaffian", "gpu", "variational monte carlo"]
@@ -16,10 +16,13 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Physics",
     "Environment :: GPU :: NVIDIA CUDA",
 ]
-dependencies = ["jax>=0.11", "numpy"]
+# jax 0.7.1 is the first release exporting pallas.triton.load / .store, which the
+# kernels use for masked access; older jax cannot run them.
+dependencies = ["jax>=0.7.1", "numpy"]
 
 [project.optional-dependencies]
 test = ["pytest"]
+dev = ["pytest", "black", "pyright"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -27,3 +30,11 @@ where = ["src"]
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 testpaths = ["tests"]
+
+[tool.black]
+target-version = ["py311"]
+
+[tool.pyright]
+include = ["src/fermix", "tests", "benchmarks"]
+pythonVersion = "3.11"
+typeCheckingMode = "standard"

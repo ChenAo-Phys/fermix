@@ -7,3 +7,4 @@ dist/
 .venv/
 *.nsys-rep
 *.sqlite
+CLAUDE.local.md

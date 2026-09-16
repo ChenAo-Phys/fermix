@@ -1,10 +1,10 @@
 """Explicit polynomial det (n <= 4) and pf (even n <= 6), plus small guarded helpers."""
+
 import jax.numpy as jnp
 
-
-# ============================================================================= tiny n: explicit polynomials
-DET_POLY_MAX = 4    # det by explicit expansion for n <= 4 (Laplace expansion in 2x2 minors at n = 4)
-PF_POLY_MAX = 6     # pf by the perfect-matching sum for n <= 6 (15 terms at n = 6)
+# ======================================================= tiny n: explicit polynomials
+DET_POLY_MAX = 4  # det by explicit expansion for n <= 4 (2x2 minors at n = 4)
+PF_POLY_MAX = 6  # pf by the perfect-matching sum for n <= 6 (15 terms at n = 6)
 
 
 def _det_poly(A):
@@ -13,21 +13,33 @@ def _det_poly(A):
     if n == 0:
         return jnp.ones(A.shape[:-2], A.dtype)
     a = lambda i, j: A[..., i, j]
-    m = lambda r, s, i, j: a(r, i) * a(s, j) - a(r, j) * a(s, i)          # 2x2 minor: rows (r, s), cols (i, j)
+    # 2x2 minor: rows (r, s), cols (i, j)
+    m = lambda r, s, i, j: a(r, i) * a(s, j) - a(r, j) * a(s, i)
     if n == 1:
         return a(0, 0)
     if n == 2:
         return m(0, 1, 0, 1)
     if n == 3:
-        return a(0, 0) * m(1, 2, 1, 2) - a(0, 1) * m(1, 2, 0, 2) + a(0, 2) * m(1, 2, 0, 1)
-    if n == 4:      # Laplace expansion along rows (0, 1): signed products of complementary 2x2 minors
-        return (m(0, 1, 0, 1) * m(2, 3, 2, 3) - m(0, 1, 0, 2) * m(2, 3, 1, 3) + m(0, 1, 0, 3) * m(2, 3, 1, 2)
-                + m(0, 1, 1, 2) * m(2, 3, 0, 3) - m(0, 1, 1, 3) * m(2, 3, 0, 2) + m(0, 1, 2, 3) * m(2, 3, 0, 1))
+        c0 = a(0, 0) * m(1, 2, 1, 2)
+        c1 = a(0, 1) * m(1, 2, 0, 2)
+        c2 = a(0, 2) * m(1, 2, 0, 1)
+        return c0 - c1 + c2
+    if n == 4:
+        # Laplace expansion along rows (0, 1): signed products of complementary
+        # 2x2 minors
+        p01 = m(0, 1, 0, 1) * m(2, 3, 2, 3)
+        p02 = m(0, 1, 0, 2) * m(2, 3, 1, 3)
+        p03 = m(0, 1, 0, 3) * m(2, 3, 1, 2)
+        p12 = m(0, 1, 1, 2) * m(2, 3, 0, 3)
+        p13 = m(0, 1, 1, 3) * m(2, 3, 0, 2)
+        p23 = m(0, 1, 2, 3) * m(2, 3, 0, 1)
+        return p01 - p02 + p03 + p12 - p13 + p23
     raise ValueError(f"_det_poly: n={n} > {DET_POLY_MAX}")
 
 
 def _pf_poly(S):
-    """pf of skew-symmetric (..., n, n) for even n <= 6 from the strict upper triangle (perfect-matching sum)."""
+    """pf of skew-symmetric (..., n, n) for even n <= 6 from the strict upper triangle
+    (perfect-matching sum)."""
     n = S.shape[-1]
     if n == 0:
         return jnp.ones(S.shape[:-2], S.dtype)
@@ -37,9 +49,14 @@ def _pf_poly(S):
         return s(0, 1)
     if n == 4:
         return pf4(0, 1, 2, 3)
-    if n == 6:      # expansion along row 0: sum_j (-1)^(j+1) s_0j pf(S without rows/cols 0, j)
-        return (s(0, 1) * pf4(2, 3, 4, 5) - s(0, 2) * pf4(1, 3, 4, 5) + s(0, 3) * pf4(1, 2, 4, 5)
-                - s(0, 4) * pf4(1, 2, 3, 5) + s(0, 5) * pf4(1, 2, 3, 4))
+    if n == 6:
+        # expansion along row 0: sum_j (-1)^(j+1) s_0j pf(S without rows/cols 0, j)
+        t1 = s(0, 1) * pf4(2, 3, 4, 5)
+        t2 = s(0, 2) * pf4(1, 3, 4, 5)
+        t3 = s(0, 3) * pf4(1, 2, 4, 5)
+        t4 = s(0, 4) * pf4(1, 2, 3, 5)
+        t5 = s(0, 5) * pf4(1, 2, 3, 4)
+        return t1 - t2 + t3 - t4 + t5
     raise ValueError(f"_pf_poly: n={n} > {PF_POLY_MAX}")
 
 
@@ -48,6 +65,7 @@ def _sign_log(x):
 
 
 def _safe_recip(x):
-    """1/x with 1/0 -> 0: the log-derivative of an exactly singular matrix is undefined, return a finite 0."""
+    """1/x with 1/0 -> 0: the log-derivative of an exactly singular matrix is undefined,
+    return a finite 0."""
     nz = x != 0
     return jnp.where(nz, 1.0 / jnp.where(nz, x, 1.0), 0.0)
