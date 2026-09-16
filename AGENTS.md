@@ -18,7 +18,7 @@ which is untracked and local to each checkout (`docs/` is reserved for the user-
 | `src/fermix/_common.py` | constants, row-tile layout cost model, register triangular inverses, padding helpers |
 | `tests/test_fermix.py` | pytest suite (CUDA GPU: the kernels, ~3 min; any other backend: the generic path, ~30 s) |
 | `.github/workflows/` | CI: black + pyright (`lint.yml`), pytest on CPU / generic path (`tests.yml`) |
-| `benchmarks/bench.py` | forward + gradient timings vs `jnp.linalg.slogdet` / `lrux.slogpf` |
+| `benchmarks/bench.py` | forward + gradient timings vs `jnp.linalg.slogdet` and the in-repo generic `_slogpf_generic` (no external baselines) |
 | `CLAUDE.local.md` | untracked local notes: kernel status, measured performance/accuracy, dead ends, Pallas/Triton/XLA gotchas |
 
 Origin: the kernels were developed as `Hubbard_Next_Neighbor_SC/project/fast_linalg/fastslog.py` (frozen); develop here.
