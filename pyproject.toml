@@ -22,7 +22,9 @@ dependencies = ["jax>=0.7.1", "numpy"]
 
 [project.optional-dependencies]
 test = ["pytest"]
-dev = ["pytest", "black", "pyright"]
+# lrux is the Pfaffian reference benchmarks/bench.py compares against, and keeps
+# pyright able to resolve that import (CI type-checks benchmarks/ too).
+dev = ["pytest", "black", "pyright", "lrux"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
