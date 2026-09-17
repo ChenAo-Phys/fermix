@@ -7,7 +7,7 @@ Designed for quantum Monte Carlo in fermionic systems: a large batch of moderate
 ## Install
 
 ```bash
-pip install -e .          # needs a CUDA build of jax >= 0.11
+pip install -e .          # needs a CUDA build of jax >= 0.7.1
 pytest                    # on a CUDA GPU this tests the kernels, elsewhere the fallback
 ```
 
@@ -25,8 +25,10 @@ sign, logabs = slogpf(S) # Pfaffian of the skew-symmetric batch
 
 All functions accept any leading batch dimensions, any n, and are `jit`/`vmap`/`grad`/`jvp` compatible.
 
-Neither `slogdet` nor `slogpf` is singular-safe in the backward (they return inf/NaN for a
-rank-deficient input), while `det` and `pf` have singular-safe backward.
+`slogdet`/`slogpf` guard exactly singular inputs with a **zero** gradient rather than inf/NaN, but
+d log|det| is genuinely infinite there, so that value is a guard and not a derivative. `det` and `pf`
+are truly singular-safe: their adjugate / null-space gradients are the correct finite derivatives for
+up to two exact zero pivots, in any position.
 
 ## Notes and limits
 
@@ -43,7 +45,8 @@ rank-deficient input), while `det` and `pf` have singular-safe backward.
 ## Development
 
 Internal developer notes live in `AGENTS.md`. `tests/` holds a compact pytest suite (forward vs float64 NumPy, tiny-n polynomials, gradients vs analytic
-references, singular inputs). `benchmarks/bench.py` reproduces the table above.
+references, singular inputs). `benchmarks/bench.py` times the forward
+and the gradient against `jnp.linalg.slogdet` and, for the Pfaffian, against the generic XLA path.
 
 `pip install -e .[dev]` adds the tooling used by CI (`.github/workflows/`): `black --check .`,
 `pyright`, and `pytest` — the last one on CPU, which exercises the generic fallback path rather than the kernels.
