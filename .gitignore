@@ -8,3 +8,7 @@ dist/
 *.nsys-rep
 *.sqlite
 CLAUDE.local.md
+benchmarks/
+
+# figures are tracked; their data file and plotting script are not
+benchmark_data.md

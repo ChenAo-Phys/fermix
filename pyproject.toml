@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "fermix"
 version = "0.1.0"
-description = "Fast batched fp32 determinants and Pfaffians on GPU with JAX/Pallas kernels, with singular-safe gradients"
+description = "Fast batched real and complex determinants and Pfaffians on GPU with JAX/Pallas kernels, with singular-safe gradients"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { file = "LICENSE" }
@@ -35,6 +35,6 @@ testpaths = ["tests"]
 target-version = ["py311"]
 
 [tool.pyright]
-include = ["src/fermix", "tests", "benchmarks"]
+include = ["src/fermix", "tests"]
 pythonVersion = "3.11"
 typeCheckingMode = "standard"

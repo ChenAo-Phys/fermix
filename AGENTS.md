@@ -1,7 +1,7 @@
 # fermix — developer / agent guide
 
-Batched fp32 `slogdet` / `slogpf` / `det` / `pf` on CUDA GPUs with Pallas (Triton) kernels, generic XLA fallback
-elsewhere, singular-safe gradients. Read this before touching the kernels; the internal design notes are in `CLAUDE.local.md`,
+Batched `slogdet` / `slogpf` / `det` / `pf` for float32 / float64 / complex64 / complex128 on CUDA GPUs with
+Pallas (Triton) kernels, generic XLA fallback elsewhere, singular-safe gradients. Read this before touching the kernels; the internal design notes are in `CLAUDE.local.md`,
 which is untracked and local to each checkout (`docs/` is reserved for the user-facing documentation).
 
 ## Layout
@@ -9,17 +9,21 @@ which is untracked and local to each checkout (`docs/` is reserved for the user-
 | file | contents |
 |---|---|
 | `src/fermix/api.py` | public functions, dtype/device check and `FermixFallbackWarning`, jitted dispatch |
-| `src/fermix/_diff.py` | `custom_jvp` cores for the four functions; `_det_gradT` / `_pf_gradT` (singular-compatible gradients); `lax.platform_dependent` kernel/generic switch |
+| `src/fermix/_field.py` | the scalar field of a call: `Field` (dtype, real component dtype, k = 1 or 2 components), `CVal` (a complex value as (re, im) real arrays with the kernels' arithmetic), the dtype-agnostic value ops (`where`, `vsum`, `abs1`, `mag`, `recip`, `unit`, `dot`, ...), ref access through component tuples (`ld` / `st` / `mld` / `mst`), and `_pcall` (pallas_call over logical arguments whose components are flattened) |
+| `src/fermix/_diff.py` | `custom_jvp` cores for the four functions (complex tangents per `jnp.linalg` conventions); `_det_gradT` (adjugate from the LU parts, det taken from the packed LU's own pivots); `_pf_grad_parts` (pf / slogpf gradients from the Parlett-Reid factors); `lax.platform_dependent` kernel/generic switch |
 | `src/fermix/_lu.py` | blocked LU kernels (inner panel, inter-panel update, U-row, trailing GEMM) and `_lu_core` (with `factors=True` export) |
 | `src/fermix/_pf.py` | blocked Parlett–Reid kernels (pair-step panel, lower-triangle mirrored update) and `_pf_core` |
-| `src/fermix/_inverse.py` | packed-LU assembly + diagonal-block kernels, sub-block GEMM kernel `_bgemm`, block-recursive inverse, `_permT`, `_lu_parts`; cuSOLVER reference path |
-| `src/fermix/_fallback.py` | generic XLA `slogdet`, batched masked Parlett–Reid `slogpf`, `_lu_parts_generic` |
+| `src/fermix/_inverse.py` | packed-LU assembly + diagonal-block kernels, sub-block GEMM kernel `_bgemm` (optional transposed operands), block-recursive inverse, `_permT`, `_lu_parts`; cuSOLVER reference path |
+| `src/fermix/_pfinv.py` | pf / slogpf backward from the forward's Parlett-Reid factors (`_pf_core(factors=True)`): assembly of the block-LDLᵀ factor L̃ + 32×32 leaf inverses, `Y = L̃⁻¹` by the block-recursive inverse, one GEMM `R = Yᵀ D̃⁻¹ Y`, the stable Pfaffian adjugate (smallest pivot isolated by Sherman–Morrison, never divided by), `_perm2` scatter; `_pf_parts` |
+| `src/fermix/_fallback.py` | generic XLA `slogdet`, batched masked Parlett–Reid `slogpf`, `_lu_parts_generic`, `_pf_parts_generic` (the factors route in plain XLA) and the shared adjugate formula `_pf_adj_blocks` (all four dtypes) |
 | `src/fermix/_poly.py` | explicit polynomials (det n ≤ 4, pf n ≤ 6) |
-| `src/fermix/_common.py` | constants, row-tile layout cost model, register triangular inverses, padding helpers |
-| `tests/test_fermix.py` | pytest suite (CUDA GPU: the kernels, ~3 min; any other backend: the generic path, ~30 s) |
+| `src/fermix/_common.py` | launch parameters per architecture and dtype kind (`Tune`, `TUNES[arch][kind]`, `_derive`, `OVERRIDE`), row-tile layout cost model, register triangular inverses, padding helpers |
+| `tests/test_fermix.py` | pytest suite parametrized over the four dtypes (CUDA GPU: the kernels; any other backend: the generic path, ~2 min); it enables `jax_enable_x64` at import |
 | `.github/workflows/` | CI: black + pyright (`lint.yml`), pytest on CPU / generic path (`tests.yml`) |
-| `benchmarks/bench.py` | forward + gradient timings vs `jnp.linalg.slogdet` and the in-repo generic `_slogpf_generic` (no external baselines) |
+| `benchmarks/` | untracked local tooling (gitignored like `CLAUDE.local.md`, so a fresh clone has none of it): `bench.py` (forward + gradient timings vs `jnp.linalg.slogdet` and the in-repo generic `_slogpf_generic`; no external baselines), `tune.py` (one-knob-at-a-time `Tune` sweeps, interleaved A/B timing, result check), `sweep_n.py` (forward n-sweep tables per dtype, markdown output), `compile_probe.py` / `compile_kernels.py` / `lower_profile.py` (compile-time breakdowns; these take `--dtype f32,f64,c64,c128`), `plot_benchmark.py` (reads the n-sweep tables of `benchmark_data.md` and writes the README figures into the tracked `plots/`) |
 | `CLAUDE.local.md` | untracked local notes: kernel status, measured performance/accuracy, dead ends, Pallas/Triton/XLA gotchas |
+| `benchmark_data.md` | untracked archive of the measured timing tables (§1 the plotted H200 n-sweeps, §2-§6 the tuning rounds); `CLAUDE.local.md` keeps the conclusions and points at the sections, so the numbers stay out of every agent session's context |
+| `plots/` | **tracked** figures shown in `README.md`: `benchmark_H200_{slogdet,slogpf}.pdf` (vector) and `.png` (what GitHub renders), regenerated by `benchmarks/plot_benchmark.py` |
 
 Origin: the kernels were developed as `Hubbard_Next_Neighbor_SC/project/fast_linalg/fastslog.py` (frozen); develop here.
 
@@ -28,15 +32,48 @@ Origin: the kernels were developed as `Hubbard_Next_Neighbor_SC/project/fast_lin
 - Test: `cd ~/fermix && CUDA_VISIBLE_DEVICES=<id> XLA_PYTHON_CLIENT_PREALLOCATE=false python -m pytest -q`.
   On the shared DGX pick the GPU with free memory (`~/.claude/scripts/local_status.sh`; CUDA ids skip the display GPU).
 - Format and types: `python -m black .` and `python -m pyright` must both be clean
-  (same as CI). Style: black at 88 columns; when a line has to be split, introduce a named intermediate
+  (same as CI). Both skip the gitignored `benchmarks/` (black skips it even when the directory is passed
+  explicitly); format those with `black benchmarks/*.py`. Style: black at 88 columns; when a line has to be split, introduce a named intermediate
   instead of nesting parentheses.
 - Timing on the shared DGX is ±15–30 % noisy (power cap, other users): only interleaved same-run A/B minima are
   comparable; record forward numbers from the same run as the numbers you compare against.
+- Launch parameters (tiles, warps, block switch, chunk costs) come from the table `_common.TUNES[arch][kind]`
+  (kind = `f32` / `f64` / `c64` / `c128`); never hard-code them in a kernel call. Retune a new GPU or kind with
+  `benchmarks/tune.py` and add a table entry (`_derive` only scales the float32 entry by the register cost).
+- **Kernels are dtype-generic.** A value is a plain array (real kinds) or a `CVal` (complex kinds); matrix buffers are
+  *parts* (tuples of real component arrays) and enter kernels as tuples of refs. Never write `jnp.where` / `jnp.sum`
+  / `jnp.abs` / `1 / x` / `jnp.sign` on a value inside a kernel — use `_field.where` / `vsum` / `abs1` (pivot
+  choice) or `mag` (log) / `recip` / `unit`, `dot(a, b, prec, three)` for tile products, `ld` / `st` / `mld` /
+  `mst` for ref access, and `fld.zeros` / `fld.eye` / `fld.rscalar` for typed constants (NumPy scalars, so the
+  x64 flag never changes an in-kernel constant). Index arithmetic stays int32 (`lax.argmax(..., jnp.int32)`;
+  `jnp.argmax` is int64 under x64 and the Triton lowering rejects it). Triton has no complex type, so complex
+  arithmetic is spelled out in `CVal`; float64 dots need M >= 16, N >= 8, K >= 16 and always run in IEEE fp64
+  (`prec` only selects the fp32 algorithm).
+- Test on a GPU with `CUDA_VISIBLE_DEVICES=<id> XLA_PYTHON_CLIENT_PREALLOCATE=false python -m pytest -q`; the
+  float32 subset is `-k f32` (~5 min), the full four-dtype suite is longer (complex kernels compile 2–4× slower).
+  Ad-hoc scripts must import the checkout (`pip install -e .` or `PYTHONPATH=src`), not a stale site-packages copy.
+- **Forward and backward must agree bit-for-bit, and the forward's efficiency comes first.** The `custom_jvp`
+  rules return their own primal (slogdet/det take it from the gradient's LU, slogpf/pf from the `factors=True`
+  run of the pf core, which only stores more and computes the same arithmetic),
+  so every configuration the two paths share — the outer LU block, tiles, warps, precision, padding — must be
+  resolved the same way in both; never give the backward its own knob, tune it for the forward and let the
+  backward pay. Tests: `test_grad_primal_is_bit_identical_to_forward`,
+  `test_tiny_n_grad_primal_is_bit_identical_to_forward`, `test_generic_branch_grad_primal_matches_forward`.
+- **Adjugate-type gradients (det, pf) must be formed from one factorisation.** A numerically singular input has a
+  round-off-level pivot; det · A⁻¹ or pf · S⁻¹ is only accurate when the same pivot value appears in both factors
+  (det from the packed LU's diagonal, not the forward's logabs; pf's adjugate from the Parlett–Reid factors, not an
+  LU of S, whose backward error is not skew). Tests: `test_det_grad_near_singular`, `test_pf_grad_near_singular`.
 - Any kernel change: re-run the full suite at small batch **and** check a B = 4096 case — cross-program hazards in
   in-place grid kernels only show up at large batch.
-- `CLAUDE.local.md` is gitignored, so a fresh clone has no notes: keep it up to date as you work (it is the only
-  record of measured numbers, dead ends and gotchas), and never put anything there that the repo needs to ship.
+- `CLAUDE.local.md` is gitignored, so a fresh clone has no notes: keep it up to date as you work (it, with
+  `benchmark_data.md`, is the only record of measured numbers, dead ends and gotchas), and never put anything there
+  that the repo needs to ship. **New timing tables go into `benchmark_data.md`**, not into the notes; if they belong
+  to the H200 n-sweeps, add the rows to its §1 and re-run `python benchmarks/plot_benchmark.py`.
   It is loaded into every agent session, so keep it dense — facts and numbers, no narrative. The long-form
   development record is in git history: `git show c640eeb:.agents/notes/development-history.md`.
-- Compile time matters (one kernel set per block; ~15 s at n = 256, ~65 s at n = 1024): never unroll per-block work into
-  one giant kernel body; use a `(B, nb)` grid with `program_id`-derived offsets.
+- Compile time: XLA compiles the Pallas kernels of one program **in parallel**, so a program's compile time is
+  roughly the slowest single kernel plus the *serial* Python lowering (~35–50 ms per `pallas_call` on a quiet node,
+  206 calls at n = 1024). Keep kernel bodies small (rolled `lax.fori_loop`s over repeated block work, e.g.
+  `diag_rolled` / `diag_loop_d`), never unroll per-block work into one giant kernel body (use a `(B, nb)` grid with
+  `program_id`-derived offsets), and check a change with `benchmarks/compile_kernels.py`. Merging kernels to save
+  lowering time lengthens the critical path, so it only pays where the merged body stays small.

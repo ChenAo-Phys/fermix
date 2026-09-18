@@ -1,5 +1,5 @@
-"""fermix: fast batched fp32 determinants and Pfaffians on GPU (JAX / Pallas), with
-singular-safe gradients.
+"""fermix: fast batched determinants and Pfaffians (float32 / float64 / complex64 /
+complex128) on GPU (JAX / Pallas), with singular-safe gradients.
 
 Public functions: :func:`slogdet`, :func:`slogpf`, :func:`det`, :func:`pf`.
 """
