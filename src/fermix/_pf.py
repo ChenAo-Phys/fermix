@@ -456,7 +456,9 @@ def _pf_run(A, n, fld, prec, tm, tn, upd_warps, factors):
     for k in range(nb):
         r0 = k * b
         last = k == nb - 1
-        layout = tuple(_layout(N - r0, r0, t.pf_chunk_cost, t.pf_max_chunk))
+        layout = tuple(
+            _layout(N - r0, r0, t.pf_chunk_cost, t.pf_max_chunk, t.pf_split_above)
+        )
         pw = _panel_warps(sum(h for _, h in layout), t, pf=True)
         panel_kw = dict(fld=fld, r0=r0, b=b, bi=bi, layout=layout, num_warps=pw)
         upd_kw = dict(fld=fld, r0=r0, b=b, bi=bi, tm=tm, tn=tn, prec=prec)

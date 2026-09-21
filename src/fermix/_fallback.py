@@ -11,6 +11,7 @@ input (``jnp.finfo(dtype).dtype``)."""
 import jax
 import jax.numpy as jnp
 from jax import lax
+from ._common import batch_any
 
 _tri_solve = lax.linalg.triangular_solve
 
@@ -114,6 +115,63 @@ def _pair_scale(d, K):
     return jnp.where(isK | (d == 0), 1, d)
 
 
+def _pf_value(d, sgnP):
+    """sgnP prod(d) through exp-log (0 if a pivot is exactly zero); pairwise trees, see
+    _pairwise."""
+    dsafe = jnp.where(d == 0, 1, d)
+    mag = jnp.exp(_pairwise(jnp.log(jnp.abs(dsafe)), jnp.add, 0))
+    return sgnP * _pairwise(jnp.sign(d), jnp.multiply, 1) * mag
+
+
+def _second_zero(d, K):
+    """(has2, is2): whether a member has an exact zero pivot other than K, and the mask
+    of the first such pivot. The adjugate formula treats one zero pivot (K) exactly;
+    with a second one the matrix can still have rank n-2 (a null row paired by the
+    pivoting with a regular row: the pair entry is 0 but the partner's column is not),
+    and since pf(S) S^-1 is affine in each pair entry of the factorisation, the exact
+    value is the mean of the formula evaluated with that pivot lifted to +1 and to -1
+    (both regular). Three or more zero pivots mean rank <= n-4 and a zero adjugate,
+    which the lifted evaluations also give."""
+    others = (d == 0) & (jnp.arange(d.shape[1])[None, :] != K[:, None])
+    has2 = jnp.any(others, axis=1)
+    first = jnp.argmax(others, axis=1)
+    is2 = has2[:, None] & (jnp.arange(d.shape[1])[None, :] == first[:, None])
+    return has2, is2
+
+
+def _lifted_mean(d, K, evaluate, adjugate):
+    """G = evaluate(d) (the adjugate formula for one exact zero pivot at most), or, for
+    a batch with a member holding a second exact zero pivot, the mean of the lifted
+    evaluations (see _second_zero); only the adjugate needs it (S^-1 of a singular
+    member is zero-guarded)."""
+    if not adjugate:
+        return evaluate(d)
+    has2, is2 = _second_zero(d, K)
+
+    def lifted(_):
+        return 0.5 * (evaluate(jnp.where(is2, 1, d)) + evaluate(jnp.where(is2, -1, d)))
+
+    return lax.cond(batch_any(has2), lifted, lambda _: evaluate(d), None)
+
+
+def _pf_adj_coeffs(d, sgnP, K, adjugate):
+    """(a1, a2, d_K) of the adjugate formula (see _pf_adj_blocks): sgnP D_K (d_K, 1 - d_K)
+    for the adjugate, (1, (1 - d_K) / d_K) for the inverse (1 / 0 -> 0)."""
+    h = d.shape[1]
+    isK = jnp.arange(h)[None, :] == K[:, None]
+    dK = jnp.take_along_axis(d, K[:, None], axis=1)[:, 0]
+    dsafe = jnp.where(d == 0, 1, d)
+    logD = _pairwise(jnp.where(isK, 0, jnp.log(jnp.abs(dsafe))), jnp.add, 0)
+    # 0 if another d is 0
+    phase = _pairwise(jnp.where(isK, 1, jnp.sign(d)), jnp.multiply, 1)
+    D = phase * jnp.exp(logD)
+    if adjugate:
+        return sgnP * D * dK, sgnP * D * (1 - dK), dK
+    nz = dK != 0
+    a2 = jnp.where(nz, (1 - dK) / jnp.where(nz, dK, 1), 0)
+    return jnp.ones_like(dK), a2, dK
+
+
 def _pf_adj_blocks(d, Y, R, sgnP, K, adjugate):
     """pf(S) S^-1 (adjugate=True) or S^-1 (False) in the factorisation's row order
     from the pivots d (B, h), Y = L~^-1, R = Y^T D~^-1 Y, the permutation sign sgnP and
@@ -125,26 +183,13 @@ def _pf_adj_blocks(d, Y, R, sgnP, K, adjugate):
 
     (1 / 0 -> 0: the caller zeroes singular members). Returns (PT, pf, d_K) with
     pf = sgnP prod d."""
-    h = d.shape[1]
-    isK = jnp.arange(h)[None, :] == K[:, None]
-    dK = jnp.take_along_axis(d, K[:, None], axis=1)[:, 0]
-    dsafe = jnp.where(d == 0, 1, d)
-    logD = jnp.sum(jnp.where(isK, 0, jnp.log(jnp.abs(dsafe))), axis=1)
-    phase = jnp.prod(jnp.where(isK, 1, jnp.sign(d)), axis=1)  # 0 if another d is 0
-    D = phase * jnp.exp(logD)
-    pf = sgnP * D * dK
-    if adjugate:
-        a1, a2 = pf, sgnP * D * (1 - dK)
-    else:
-        nz = dK != 0
-        a1 = jnp.ones_like(dK)
-        a2 = jnp.where(nz, (1 - dK) / jnp.where(nz, dK, 1), 0)
+    a1, a2, _ = _pf_adj_coeffs(d, sgnP, K, adjugate)
     aK = (2 * K)[:, None, None]
     w = jnp.take_along_axis(R, aK, axis=2)[:, :, 0]
     v = jnp.take_along_axis(Y, aK, axis=1)[:, 0, :]
     outer = lambda x, y: x[:, :, None] * y[:, None, :]
     PT = a1[:, None, None] * R + a2[:, None, None] * (outer(w, v) - outer(v, w))
-    return -PT, pf, dK
+    return -PT
 
 
 def _pf_parts_generic(S, adjugate):
@@ -188,29 +233,34 @@ def _pf_parts_generic(S, adjugate):
     perm0 = jnp.broadcast_to(ar, (B, n))
     init = (S, jnp.zeros_like(S), perm0, jnp.ones(B, dt))
     init += (jnp.zeros(B, jnp.finfo(dt).dtype), jnp.zeros(B, bool))
-    T, L, perm, sign, log, par = lax.fori_loop(0, n // 2, step, init)
+    T, L0, perm, sign, log, par = lax.fori_loop(0, n // 2, step, init)
     h = n // 2
     hp = lax.Precision.HIGHEST
     d = jnp.diagonal(T[:, 0::2, 1::2], axis1=1, axis2=2)  # T[2s, 2s+1]: the pivots
     K = _pivot_index(d, n)
-    dt_ = _pair_scale(d, K)
-    # L~: the a columns scaled by 1/d~, unit diagonal
-    scale = jnp.stack([1 / dt_, jnp.ones_like(dt_)], axis=2).reshape(B, n)
-    L = L * scale[:, None, :] + jnp.eye(n, dtype=dt)
-    eye = jnp.broadcast_to(jnp.eye(n, dtype=dt), (B, n, n))
-    Y = _tri_solve(L, eye, left_side=True, lower=True, unit_diagonal=True)
-    Yr = Y.reshape(B, h, 2, n)
-    DY = jnp.stack([Yr[:, :, 1], -Yr[:, :, 0]], axis=2) / dt_[:, :, None, None]
-    R = jnp.matmul(jnp.swapaxes(Y, 1, 2), DY.reshape(B, n, n), precision=hp)
     sgnP = jnp.where(par, -1.0, 1.0).astype(dt)
-    PT, pf, dK = _pf_adj_blocks(d, Y, R, sgnP, K, adjugate)
+    eye = jnp.broadcast_to(jnp.eye(n, dtype=dt), (B, n, n))
     iperm = jnp.argsort(perm, axis=1)  # G_S[perm[f], perm[c]] = PT[f, c]
-    G = jnp.take_along_axis(PT, iperm[:, :, None], axis=1)
-    G = jnp.take_along_axis(G, iperm[:, None, :], axis=2)
+
+    def evaluate(dd):
+        dt_ = _pair_scale(dd, K)
+        # L~: the a columns scaled by 1/d~, unit diagonal
+        scale = jnp.stack([1 / dt_, jnp.ones_like(dt_)], axis=2).reshape(B, n)
+        L = L0 * scale[:, None, :] + jnp.eye(n, dtype=dt)
+        Y = _tri_solve(L, eye, left_side=True, lower=True, unit_diagonal=True)
+        Yr = Y.reshape(B, h, 2, n)
+        DY = jnp.stack([Yr[:, :, 1], -Yr[:, :, 0]], axis=2) / dt_[:, :, None, None]
+        R = jnp.matmul(jnp.swapaxes(Y, 1, 2), DY.reshape(B, n, n), precision=hp)
+        PT = _pf_adj_blocks(dd, Y, R, sgnP, K, adjugate)
+        G = jnp.take_along_axis(PT, iperm[:, :, None], axis=1)
+        return jnp.take_along_axis(G, iperm[:, None, :], axis=2)
+
+    G = _lifted_mean(d, K, evaluate, adjugate)
     if not adjugate:
+        dK = jnp.take_along_axis(d, K[:, None], axis=1)[:, 0]
         bad = (dK == 0) | ~jnp.all(jnp.isfinite(G), axis=(1, 2))
         G = jnp.where(bad[:, None, None], 0, G)
-    return sign, log, G, pf
+    return sign, log, G, _pf_value(d, sgnP)
 
 
 def _slogpf_generic(S):

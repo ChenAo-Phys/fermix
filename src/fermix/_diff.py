@@ -12,12 +12,13 @@ from jax import lax
 from . import _inverse
 from ._fallback import (
     _lu_parts_generic,
+    _pairwise,
     _pf_parts_generic,
     _slogdet_generic,
     _slogpf_generic,
 )
 from ._field import Field
-from ._common import _lu_block, _tune
+from ._common import _lu_block, _tune, batch_any, isum
 from ._inverse import _lu_parts
 from ._lu import _lu_core
 from ._pf import _pf_core
@@ -158,13 +159,22 @@ def _slogpf_diff(n, dtype, prec, upd_warps, fast):
 
 # ===================================== det / pf: singular-compatible gradients
 def _perm_sign(g0, dt):
-    """(-1)^(number of inversions) of the row permutation g0 (B, N)."""
-    N = g0.shape[1]
-    i = jnp.arange(N)
-    greater = g0[:, :, None] > g0[:, None, :]
-    ordered = i[:, None] < i[None, :]
-    inv = jnp.sum(greater & ordered, axis=(1, 2))
-    return (1.0 - 2.0 * (inv % 2)).astype(dt)
+    """sgn(P) = (-1)^(N - number of cycles) of the row permutation g0 (B, N). The
+    cycles are counted by pointer jumping: in ceil(log2 N) rounds of two (B, N)
+    gathers every element's label becomes the smallest index of its cycle (lab covers
+    2^r consecutive orbit elements after r rounds, p = g^(2^r)), and each cycle has
+    exactly one element labelled by itself. The former inversion count -- a reduce
+    over the (B, N, N) comparison table -- was the gradient's largest XLA fusion and
+    made XLA's GPU compile blow up with B and N (n = 256, B = 4096: the det gradient
+    never finished compiling, > 20 min in that one reduce fusion; n = 128: 27 s)."""
+    B, N = g0.shape
+    idx = jnp.broadcast_to(jnp.arange(N, dtype=g0.dtype), (B, N))
+    lab, p = idx, g0
+    for _ in range(max(N - 1, 0).bit_length()):  # ceil(log2 N) doubling rounds
+        lab = jnp.minimum(lab, jnp.take_along_axis(lab, p, axis=1))
+        p = jnp.take_along_axis(p, p, axis=1)
+    ncyc = isum(lab == idx, axis=1)
+    return (1.0 - 2.0 * ((N - ncyc) % 2)).astype(dt)
 
 
 def _diag_zero(LU):
@@ -192,10 +202,11 @@ def _lu_det(d, g0, fld):
     its tiny pivot differs from the panel's by O(1) relative, and det_fwd * A^-T was
     off by that ratio (measured 2026-09-18: median 20 % / max 30x at n = 8..16 for
     rank n-1 float32 inputs; with this det 1e-6, like jnp.linalg.det's cofactor
-    solve)."""
+    solve). The reductions are explicit pairwise trees (_fallback._pairwise), so the
+    value does not depend on the program's reduction order (batched vs vmapped)."""
     dsafe = jnp.where(d == 0, 1, d)
-    logsum = jnp.sum(jnp.log(jnp.abs(dsafe)), axis=1)
-    phase = jnp.prod(jnp.sign(dsafe), axis=1)  # d / |d| for complex d
+    logsum = _pairwise(jnp.log(jnp.abs(dsafe)), jnp.add, 0)
+    phase = _pairwise(jnp.sign(dsafe), jnp.multiply, 1)  # d / |d| for complex d
     det = _perm_sign(g0, fld.dtype) * phase * jnp.exp(logsum)
     return jnp.where(jnp.any(d == 0, axis=1), 0, det)
 
@@ -241,7 +252,7 @@ def _det_gradT(invT, LU, g0, zero, n, fld):
         G = s[:, None, None] * col[:, :, None] * u1[:, None, :]
         return jnp.where((m >= 1)[:, None, None], G, regular)
 
-    return lax.cond(jnp.any(m >= 1), singular, lambda _: regular, None)
+    return lax.cond(batch_any(m >= 1), singular, lambda _: regular, None)
 
 
 def _det_small_gradT(A, n, fld, prec, unroll_steps, block):
@@ -261,7 +272,7 @@ def _det_small_gradT(A, n, fld, prec, unroll_steps, block):
         return _det_gradT(*parts[2:], n, fld)
 
     exact = lambda A: _on_cuda(A, kernels, lambda A: G_gen)
-    G = lax.cond(jnp.any(zero), exact, lambda A: G_gen, A)
+    G = lax.cond(batch_any(zero), exact, lambda A: G_gen, A)
     return d, G
 
 

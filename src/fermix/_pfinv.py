@@ -26,8 +26,11 @@ R = Y^T D~^-1 Y (= Lambda^-T D~ Lambda^-1), w = R e_{a_K} and v = Y^T e_{a_K}
     S^-1 = -[R + c (w v^T - v w^T)],   c = (1 - d_K) / d_K,
     pf(S) S^-1 = -D_K [d_K R + (1 - d_K)(w v^T - v w^T)],   D_K = prod_{s != K} d_s,
 
-exact for any d_K and finite at d_K = 0 (the rank-2 Pfaffian adjugate; a second zero
-pivot makes D_K = 0). Everything is formed from well-conditioned pieces and d_K enters
+exact for any d_K and finite at d_K = 0 (the rank-2 Pfaffian adjugate). A second exact
+zero pivot does not necessarily mean a zero adjugate (a null row paired with a regular
+row leaves rank n-2): pf(S) S^-1 is affine in each pair entry, so that pivot is lifted
+to +1 and -1 and the two exact evaluations averaged (`_fallback._lifted_mean`, a rare
+lax.cond branch). Everything is formed from well-conditioned pieces and d_K enters
 linearly. Cost: L~^-1 by the block-recursive unit-lower inverse (N^3 / 3), one N^3
 sub-block GEMM for R, elementwise work and the permutation scatter -- less than the
 LU-based route it replaces (LU kernels + 1.67 N^3 inverse)."""
@@ -39,7 +42,13 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import triton as plgpu
 from ._field import where, dot, ld, st, mst, _pcall
 from ._common import _unit_lower_inv, _full, _vec, _tune
-from ._fallback import _pf_adj_blocks, _pivot_index, _pair_scale
+from ._fallback import (
+    _lifted_mean,
+    _pair_scale,
+    _pf_adj_coeffs,
+    _pf_value,
+    _pivot_index,
+)
 from ._inverse import LEAF, _bgemm, _inv_unit_lower
 from ._pf import _pf_core_factors
 
@@ -127,26 +136,38 @@ def _pf_maps(srcs, b, N):
     return gs[0], idx
 
 
-# ------------------------------------------------ P^T Z P (2-D scatter, 4 warps)
-def _perm2_kernel(z_ref, g_ref, out_ref, *, n, tm):
+# ---------------- adjugate assembly + P^T (.) P (2-D scatter), one pass, 4 warps
+def _adj_perm_kernel(r_ref, w_ref, v_ref, a_ref, g_ref, out_ref, *, n, tm):
+    """out[g0[f], g0[c]] = -(a1 R + a2 (w v^T - v w^T))[f, c] on the leading n x n
+    block: the adjugate formula of _fallback._pf_adj_blocks fused with the permutation
+    scatter (a single read of R). a_ref holds (a1, a2) per matrix."""
     i0 = pl.program_id(1) * tm
     c0 = pl.program_id(2) * tm
-    tile = ld(z_ref, (pl.ds(i0, tm), pl.ds(c0, tm)))
+    tile = ld(r_ref, (pl.ds(i0, tm), pl.ds(c0, tm)))
+    wi = ld(w_ref, (pl.ds(i0, tm),))
+    wc = ld(w_ref, (pl.ds(c0, tm),))
+    vi = ld(v_ref, (pl.ds(i0, tm),))
+    vc = ld(v_ref, (pl.ds(c0, tm),))
+    a1 = ld(a_ref, (0,))
+    a2 = ld(a_ref, (1,))
+    rank2 = wi[:, None] * vc[None, :] - vi[:, None] * wc[None, :]
+    val = -(a1 * tile + a2 * rank2)
     gi = g_ref[pl.ds(i0, tm)]
     gc = g_ref[pl.ds(c0, tm)]
     mask = (gi < n)[:, None] & (gc < n)[None, :]
-    mst(out_ref, (gi[:, None], gc[None, :]), tile, mask=mask)
+    mst(out_ref, (gi[:, None], gc[None, :]), val, mask=mask)
 
 
-def _perm2(Z, g0, n, fld):
-    """out[g0[f], g0[c]] = Z[f, c] restricted to the leading n x n block, i.e.
-    P^T Z P for P[f, g0[f]] = 1 (the padding rows g0 >= n are dropped)."""
-    B, N, _ = Z[0].shape
+def _adj_perm(R, w, v, a12, g0, n, fld):
+    """The (B, n, n) array of the field with out[g0[f], g0[c]] = PT[f, c],
+    PT = -(a1 R + a2 (w v^T - v w^T)) (the padding rows g0 >= n are dropped); R, w, v
+    as parts of (B, N, N) / (B, N), a12 the (B, 2) coefficients as parts."""
+    B, N, _ = R[0].shape
     tm = 64 if N % 64 == 0 else 32
-    kern = functools.partial(_perm2_kernel, n=n, tm=tm)
+    kern = functools.partial(_adj_perm_kernel, n=n, tm=tm)
     out_spec = pl.BlockSpec((None, n, n), lambda *idx: (idx[0], 0, 0))
     outs = [(fld.structs((B, n, n)), out_spec)]
-    ins = [(Z, _full(N)), (g0, _vec(N))]
+    ins = [(R, _full(N)), (w, _vec(N)), (v, _vec(N)), (a12, _vec(2)), (g0, _vec(N))]
     return _pcall(kern, ins, outs, (B, N // tm, N // tm), num_warps=4)[0]
 
 
@@ -168,33 +189,46 @@ def _pf_parts(S, n, fld, prec, upd_warps, adjugate):
         tuple(jnp.concatenate([dk[c] for dk in ds], axis=1) for c in range(fld.k))
     )
     K = _pivot_index(d, n)
-    dt_ = _pair_scale(d, K)  # d~: pivot K and exact zeros -> 1
-    dinv = fld.split(1 / dt_)
+    parity = jnp.sum(jnp.concatenate(pars, axis=1), axis=1) % 2
+    sgnP = jnp.where(parity == 1, -1.0, 1.0).astype(fld.dtype)
     gspec = pl.BlockSpec((None, N, b), lambda bi, i: (bi, 0, 0))
     leaf_spec = pl.BlockSpec((None, nb, LEAF, LEAF), lambda bi, i: (bi, 0, 0, 0))
-    ins = [(g, gspec) for g in gbufs] + [(idx, _vec(nb * N)), (dinv, _vec(h))]
-    outs = [
-        (fld.structs((B, N, N)), _full(N)),
-        (fld.structs((B, nb, LEAF, LEAF)), leaf_spec),
-    ]
     kern = functools.partial(
         _pf_assemble_kernel, fld=fld, N=N, b=b, nb=nb, rolled=t.diag_rolled
     )
-    L, Lleaf = _pcall(kern, ins, outs, (B, nb), num_warps=t.diag_warps)
-    Y = _inv_unit_lower(L, Lleaf, prec, fld)  # L~^-1
-    Yj = fld.join(Y)
-    # D~^-1 Y: the rows of each pair (a, p) -> (Y[p], -Y[a]) / d~
-    Yr = Yj.reshape(B, h, 2, N)
-    DY = jnp.stack([Yr[:, :, 1], -Yr[:, :, 0]], axis=2) / dt_[:, :, None, None]
-    DY = fld.split(DY.reshape(B, N, N))
     at0 = dict(ra=0, ca=0, rb=0, cb=0, rc=0, cc=0)
     dims = dict(M=N, Nn=N, K=N, prec=prec, fld=fld)
-    R = fld.join(_bgemm((Y, DY), 0, 1, None, ta=True, **at0, **dims))  # Y^T D~^-1 Y
-    parity = jnp.sum(jnp.concatenate(pars, axis=1), axis=1) % 2
-    sgnP = jnp.where(parity == 1, -1.0, 1.0).astype(fld.dtype)
-    PT, pf, dK = _pf_adj_blocks(d, Yj, R, sgnP, K, adjugate)
-    G = fld.join(_perm2(fld.split(PT), g0, n, fld))
+
+    def evaluate(dd):
+        """The formula for the pivots dd (d, or d with a second zero lifted)."""
+        dt_ = _pair_scale(dd, K)  # d~: pivot K and exact zeros -> 1
+        dinv = fld.split(1 / dt_)
+        ins = [(g, gspec) for g in gbufs] + [(idx, _vec(nb * N)), (dinv, _vec(h))]
+        outs = [
+            (fld.structs((B, N, N)), _full(N)),
+            (fld.structs((B, nb, LEAF, LEAF)), leaf_spec),
+        ]
+        L, Lleaf = _pcall(kern, ins, outs, (B, nb), num_warps=t.diag_warps)
+        Y = _inv_unit_lower(L, Lleaf, prec, fld)  # L~^-1
+        Yj = fld.join(Y)
+        # D~^-1 Y: the rows of each pair (a, p) -> (Y[p], -Y[a]) / d~
+        Yr = Yj.reshape(B, h, 2, N)
+        DY = jnp.stack([Yr[:, :, 1], -Yr[:, :, 0]], axis=2) / dt_[:, :, None, None]
+        DY = fld.split(DY.reshape(B, N, N))
+        # R = Y^T D~^-1 Y is skew: lower tiles + mirror when the table says so
+        R = _bgemm((Y, DY), 0, 1, None, ta=True, skew=t.pf_skew_r, **at0, **dims)
+        # w = R e_{a_K}, v = Y^T e_{a_K} (a_K = 2K); the assembly of
+        # -(a1 R + a2 (w v^T - v w^T)) is fused with the permutation scatter
+        a1, a2, _ = _pf_adj_coeffs(dd, sgnP, K, adjugate)
+        aK = (2 * K)[:, None]
+        w = tuple(jnp.take_along_axis(Rc, aK[:, :, None], axis=2)[:, :, 0] for Rc in R)
+        v = tuple(jnp.take_along_axis(Yc, aK[:, None, :], axis=1)[:, 0, :] for Yc in Y)
+        a12 = fld.split(jnp.stack([a1, a2], axis=1))
+        return fld.join(_adj_perm(R, w, v, a12, g0, n, fld))
+
+    G = _lifted_mean(d, K, evaluate, adjugate)
     if not adjugate:
+        dK = jnp.take_along_axis(d, K[:, None], axis=1)[:, 0]
         bad = (dK == 0) | ~jnp.all(jnp.isfinite(G), axis=(1, 2))
         G = jnp.where(bad[:, None, None], 0, G)
-    return sign, logabs, G, pf
+    return sign, logabs, G, _pf_value(d, sgnP)

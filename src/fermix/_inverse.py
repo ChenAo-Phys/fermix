@@ -264,14 +264,19 @@ def _bgemm_kernel(
     prec,
     ta,
     tb,
+    skew,
 ):
     """out[rc:rc+M, cc:cc+Nn] = beta * out[...] + alpha * A[ra:ra+M, ca:ca+K]
     @ B[rb:rb+K, cb:cb+Nn] on 2-D sub-blocks of the batched operands refs[ia], refs[ib]
     (out = refs[-1], possibly aliased to one of them). Edge tiles are masked. With
     ta / tb the operand is the transpose of the stored block A[ra:ra+K, ca:ca+M] /
-    B[rb:rb+Nn, cb:cb+K] (tiles are transposed in registers)."""
+    B[rb:rb+Nn, cb:cb+K] (tiles are transposed in registers). skew: the product is
+    known to be skew-symmetric (square, tm == tn, beta = 0): only the tiles on and
+    below the diagonal are computed, the ones above are their negated transposes
+    (edge tiles, when M is not a multiple of tm, are masked in both stores)."""
     a_ref, b_ref, out_ref = refs[ia], refs[ib], refs[-1]
-    three = _tune(fld.kind).cplx_dot3
+    geom = dict(ra=ra, ca=ca, rb=rb, cb=cb, K=K, tm=tm, tn=tn, tk=tk, prec=prec)
+    _bgemm_tile = _bgemm_tile_factory(fld, ta=ta, tb=tb, **geom)
     i0 = pl.program_id(1) * tm
     j0 = pl.program_id(2) * tn
     full = M % tm == 0 and Nn % tn == 0
@@ -279,34 +284,29 @@ def _bgemm_kernel(
     cj = lax.broadcasted_iota(jnp.int32, (tn,), 0)
     rvalid = (i0 + ri) < M
     cvalid = (j0 + cj) < Nn
+    if skew:
+        assert tm == tn and beta == 0.0 and rc == cc
 
-    def body(t, acc):
-        kk = pl.multiple_of(t * tk, tk)
-        if ta:
-            a_idx = (pl.ds(ra + kk, tk), pl.ds(ca + i0, tm))
-            a_mask = rvalid[None, :]
-        else:
-            a_idx = (pl.ds(ra + i0, tm), pl.ds(ca + kk, tk))
-            a_mask = rvalid[:, None]
-        if tb:
-            b_idx = (pl.ds(rb + j0, tn), pl.ds(cb + kk, tk))
-            b_mask = cvalid[:, None]
-        else:
-            b_idx = (pl.ds(rb + kk, tk), pl.ds(cb + j0, tn))
-            b_mask = cvalid[None, :]
-        if full:
-            Ab = ld(a_ref, a_idx)
-            Bb = ld(b_ref, b_idx)
-        else:
-            Ab = mld(a_ref, a_idx, mask=a_mask)
-            Bb = mld(b_ref, b_idx, mask=b_mask)
-        if ta:
-            Ab = Ab.T
-        if tb:
-            Bb = Bb.T
-        return acc + dot(Ab, Bb, prec, three)
+        def lower():
+            acc = _bgemm_tile(a_ref, b_ref, i0, j0, rvalid, cvalid, full)
+            if alpha != 1.0:
+                acc = alpha * acc
+            out_idx = (pl.ds(rc + i0, tm), pl.ds(cc + j0, tn))
+            mir_idx = (pl.ds(rc + j0, tn), pl.ds(cc + i0, tm))
+            if full:
+                st(out_ref, out_idx, acc)
+                pl.when(j0 < i0)(lambda: st(out_ref, mir_idx, -acc.T))
+            else:
+                # edge tiles (M not a multiple of tm): the mirror of a masked
+                # (rows, cols) tile is masked on (cols, rows)
+                m2 = rvalid[:, None] & cvalid[None, :]
+                mst(out_ref, out_idx, acc, mask=m2)
+                pl.when(j0 < i0)(lambda: mst(out_ref, mir_idx, -acc.T, mask=m2.T))
 
-    acc = lax.fori_loop(0, K // tk, body, fld.zeros((tm, tn)))
+        pl.when(j0 <= i0)(lower)
+        return
+
+    acc = _bgemm_tile(a_ref, b_ref, i0, j0, rvalid, cvalid, full)
     out_idx = (pl.ds(rc + i0, tm), pl.ds(cc + j0, tn))
     if full:
         if beta != 0.0:
@@ -322,6 +322,43 @@ def _bgemm_kernel(
         elif alpha != 1.0:
             acc = alpha * acc
         mst(out_ref, out_idx, acc, mask=m2)
+
+
+def _bgemm_tile_factory(fld, ra, ca, rb, cb, K, tm, tn, tk, prec, ta, tb):
+    """The K loop of one output tile of _bgemm_kernel (closure over the static
+    geometry), returning acc = A_blk[i0:i0+tm, :] @ B_blk[:, j0:j0+tn]."""
+    three = _tune(fld.kind).cplx_dot3
+
+    def tile(a_ref, b_ref, i0, j0, rvalid, cvalid, full):
+        def body(t, acc):
+            kk = pl.multiple_of(t * tk, tk)
+            if ta:
+                a_idx = (pl.ds(ra + kk, tk), pl.ds(ca + i0, tm))
+                a_mask = rvalid[None, :]
+            else:
+                a_idx = (pl.ds(ra + i0, tm), pl.ds(ca + kk, tk))
+                a_mask = rvalid[:, None]
+            if tb:
+                b_idx = (pl.ds(rb + j0, tn), pl.ds(cb + kk, tk))
+                b_mask = cvalid[:, None]
+            else:
+                b_idx = (pl.ds(rb + kk, tk), pl.ds(cb + j0, tn))
+                b_mask = cvalid[None, :]
+            if full:
+                Ab = ld(a_ref, a_idx)
+                Bb = ld(b_ref, b_idx)
+            else:
+                Ab = mld(a_ref, a_idx, mask=a_mask)
+                Bb = mld(b_ref, b_idx, mask=b_mask)
+            if ta:
+                Ab = Ab.T
+            if tb:
+                Bb = Bb.T
+            return acc + dot(Ab, Bb, prec, three)
+
+        return lax.fori_loop(0, K // tk, body, fld.zeros((tm, tn)))
+
+    return tile
 
 
 def _bgemm(
@@ -345,6 +382,7 @@ def _bgemm(
     beta=0.0,
     ta: Any = False,  # bool; Any because callers unpack mixed-type **dims dicts
     tb: Any = False,
+    skew: Any = False,
 ):
     """Batched sub-block GEMM on (B, ., .) parts: out[rc:rc+M, cc:cc+Nn] = beta*out +
     alpha * A_blk @ B_blk with A = arrays[ia][ra:ra+M, ca:ca+K],
@@ -352,16 +390,22 @@ def _bgemm(
     output; it may also be ia/ib as long as the read and written blocks do not overlap
     across programs), or None for a fresh (B, M, Nn) output. No slice copies: the
     kernels address the sub-blocks directly. ta / tb: use the transpose of the stored
-    block arrays[ia][ra:ra+K, ca:ca+M] / arrays[ib][rb:rb+Nn, cb:cb+K] instead."""
+    block arrays[ia][ra:ra+K, ca:ca+M] / arrays[ib][rb:rb+Nn, cb:cb+K] instead. skew: a
+    skew-symmetric square product (fresh output), computed on and below the diagonal
+    only and mirrored (half the tensor-core work)."""
     Bn = arrays[0][0].shape[0]
     t = _tune(fld.kind)
-    # tall tiles (128x64 on A100) measured best for the big nodes
-    tm = t.inv_tm_big if M % t.inv_tm_big == 0 else min(t.inv_tile, _next_pow2(M))
-    tn = min(t.inv_tile, _next_pow2(Nn))
+    if skew:
+        assert M == Nn and ic is None and beta == 0.0
+        tm = tn = min(t.inv_tile, _next_pow2(M))
+    else:
+        # tall tiles (128x64 on A100) measured best for the big nodes
+        tm = t.inv_tm_big if M % t.inv_tm_big == 0 else min(t.inv_tile, _next_pow2(M))
+        tn = min(t.inv_tile, _next_pow2(Nn))
     tk = min(t.inv_tk, K)
     shapes = dict(M=M, Nn=Nn, K=K, tm=tm, tn=tn, tk=tk)
     offsets = dict(ra=ra, ca=ca, rb=rb, cb=cb, rc=rc, cc=cc)
-    scale = dict(alpha=alpha, beta=beta, prec=prec, ta=ta, tb=tb)
+    scale = dict(alpha=alpha, beta=beta, prec=prec, ta=ta, tb=tb, skew=skew)
     kern = functools.partial(
         _bgemm_kernel, fld=fld, ia=ia, ib=ib, **shapes, **offsets, **scale
     )

@@ -1,0 +1,24 @@
+cff-version: 1.2.0
+message: "If you use fermix in your research, please cite it as below."
+title: "fermix: Fast batched determinants and Pfaffians in JAX"
+abstract: >-
+  Batched slogdet / slogpf / det / pf for float32, float64, complex64 and
+  complex128 matrices on NVIDIA GPUs, written in JAX with Pallas (Triton)
+  kernels.
+type: software
+authors:
+  - family-names: Chen
+    given-names: Ao
+    email: aochen@caltech.edu
+repository-code: "https://github.com/ChenAo-Phys/fermix"
+url: "https://github.com/ChenAo-Phys/fermix"
+license: MIT
+version: 0.1.0
+date-released: "2026-09-19"
+keywords:
+  - jax
+  - pallas
+  - determinant
+  - pfaffian
+  - gpu
+  - variational monte carlo

@@ -6,6 +6,7 @@ import dataclasses
 import jax
 import jax.numpy as jnp
 from jax import lax
+from jax.custom_batching import custom_vmap
 from jax.experimental import pallas as pl
 from ._field import Field, where, vsum, recip, iszero
 
@@ -41,9 +42,13 @@ class Tune:
     lu_chunk_cost: int = 64
     pf_chunk_cost: int = 512
     # split register row-chunks taller than this (power of 2; smaller chunks halve the
-    # reduction temporaries of a step at the price of more partial reductions)
+    # reduction temporaries of a step at the price of more partial reductions);
+    # pf_split_above > 0 applies the pf split only to blocks with more active rows
+    # than that (the c128 pf panel on Ampere spills from 768 rows: 256-row chunks are
+    # 1.5x there, but a lone 512-row block is 0.91x when split)
     lu_max_chunk: int = 1 << 30
     pf_max_chunk: int = 1 << 30
+    pf_split_above: int = 0
     # panel kernels: 1 warp per matrix up to panel_rows_1w active rows (warp-shuffle
     # reductions), 2 warps up to panel_rows_2w (half the registers per thread, so
     # twice the resident warps, but cross-warp reductions), 4 warps up to
@@ -112,8 +117,14 @@ class Tune:
     # det uses the generic LU the same way for n <= this ("small" mode in _diff): the
     # forward and the regular gradient come from cuSOLVER's batched LU, and only a batch
     # with an exact zero pivot (where that LU is not valid, see api._det_mode) reruns
-    # the gradient through the kernels. 0 = kernels at every n (until measured).
-    det_generic_max_n: int = 0
+    # the gradient through the kernels. Measured on the A100 (2026-09-18): the det
+    # crossovers coincide with slogdet's, and fermix's generic det gradient beats
+    # jnp.linalg.det's cofactor solve by 10-40 %; the Hopper values follow its slogdet
+    # crossovers (det itself unmeasured there).
+    det_generic_max_n: int = 32
+    # pf backward: compute R = Y^T D~^-1 Y (skew-symmetric) on and below the diagonal
+    # only and mirror the tiles (half the GEMM work of the pf gradient's largest step)
+    pf_skew_r: bool = True
 
 
 def _derive(base, regs, **over):
@@ -167,6 +178,7 @@ REGS = {"f32": 1, "f64": 2, "c64": 2, "c128": 4}
 KIND_OVERRIDES = {
     "f64": dict(
         lu_generic_max_n=40,
+        det_generic_max_n=40,
         lu_unroll_max_n=0,
         lu_chunk_cost=32,
         panel_rows_1w=128,
@@ -178,6 +190,7 @@ KIND_OVERRIDES = {
     ),
     "c64": dict(
         lu_generic_max_n=48,
+        det_generic_max_n=48,
         lu_unroll_max_n=0,
         panel_rows_1w=128,
         panel_rows_2w=256,
@@ -186,6 +199,7 @@ KIND_OVERRIDES = {
     ),
     "c128": dict(
         lu_generic_max_n=48,
+        det_generic_max_n=48,
         lu_unroll_max_n=0,
         lu_gemm_tm=32,
         lu_gemm_tn=64,
@@ -198,6 +212,66 @@ KIND_OVERRIDES = {
         inv_tile=32,
         inv_tk=16,
         diag_warps=1,
+    ),
+}
+
+
+# Ampere (A100-80GB, Rusty workergpu072, 2026-09-18, `benchmarks/small_n.py`, B = 4096 and
+# 32768, min of 30): cuSOLVER's batched LU beats the one-block kernels up to n = 32 for
+# float32 and float64 in both slogdet and det (forward and gradient; the H200 value 40
+# for float64 is a loss here: n = 40 kernels 1.7 ms vs generic 5.0), so det takes the
+# generic LU there too ("small" mode, api._det_mode). Complex kinds: see CLAUDE.local.md.
+# Ampere sweeps of the wide kinds (2026-09-19, quiet A100s: tune.py --what det/pf/grad,
+# n = 128 / 256 / 512, interleaved ratios vs the table; CLAUDE.local.md):
+# - the pf panels want 2 warps earlier than the derived tables say: f64 / c64 2 warps
+#   from 65 rows (1.34 / 1.12 at n = 128, 1.06 / 1.03 at 256, ~1.0 at 512), c128 from
+#   33 rows (1.06 / 1.10 at n = 128 / 256);
+# - c64 pf update tiles 32x32 (1.11-1.13 at every n; the H200 kept 64x64 for c64);
+# - f64 and c128 trailing GEMM as the 4-tile loop (1.04-1.05 / 1.06-1.09), and f64
+#   64-blocks from n = 192 (1.08 at n = 256; the gradient shares the switch);
+# - pf update multi-tile loop pf_upd_nt = 8 for the wide kinds (against the new base:
+#   f64 1.01 / 1.08 / 1.05, c64 1.01 / 1.02 / 1.04, c128 1.00 / 1.03 / 1.03; bit-identical);
+# - the c128 inverse (grad) knobs are all <= 1.0: table kept.
+AMPERE_KIND_OVERRIDES = {
+    "f32": {},
+    "f64": dict(
+        KIND_OVERRIDES["f64"],
+        pf_upd_nt=8,
+        lu_generic_max_n=32,
+        det_generic_max_n=32,
+        lu_gemm_nt=4,
+        lu_block_switch=128,
+        pf_panel_rows_1w=64,
+        pf_panel_rows_2w=128,
+        pf_panel_rows_4w=256,
+    ),
+    # the 64x64 complex64 trailing-GEMM tile spills on the A100: with it slogdet took
+    # 9.8 ms at n = 48 (B = 4096) vs 1.96 with 32x64 tiles, and at n = 128 / 256 the
+    # 64x64 tile is 17x / 25x slower (tune.py 2026-09-18); 32x64 as for c128. With the
+    # fix the c64 crossover is 48 (forward 2.0 vs 2.0 ms at n = 48, gradient 4.3 vs 3.7)
+    "c64": dict(
+        KIND_OVERRIDES["c64"],
+        pf_upd_nt=8,
+        lu_gemm_tm=32,
+        lu_gemm_tn=64,
+        pf_tm=32,
+        pf_tn=32,
+        pf_panel_rows_1w=64,
+        pf_panel_rows_2w=128,
+        pf_panel_rows_4w=256,
+    ),
+    "c128": dict(
+        KIND_OVERRIDES["c128"],
+        pf_upd_nt=8,
+        lu_gemm_nt=4,
+        pf_panel_rows_1w=32,
+        pf_panel_rows_2w=64,
+        pf_panel_rows_4w=128,
+        # pf panel blocks taller than 512 rows spill on the A100: 256-row chunks are
+        # 1.50x at n = 768 (128-row ones 1.25x), while the 512-row block is best whole
+        # (0.91x when split)
+        pf_max_chunk=256,
+        pf_split_above=512,
     ),
 }
 
@@ -219,7 +293,7 @@ def _table(f32, overrides=KIND_OVERRIDES):
 # Ampere table untested (they address register pressure, not the architecture).
 # See CLAUDE.local.md for the measurements.
 TUNES = {
-    "ampere": _table(Tune()),
+    "ampere": _table(Tune(), AMPERE_KIND_OVERRIDES),
     "hopper": _table(
         Tune(
             lu_block_switch=128,
@@ -277,13 +351,16 @@ def _split_chunks(layout, max_chunk):
     return out
 
 
-def _layout(m, r0, per_chunk, max_chunk=1 << 30):
+def _layout(m, r0, per_chunk, max_chunk=1 << 30, split_above=0):
     """Row-tile layout for a block with m active rows at r0: list of (offset relative to
     r0, height). Candidates: exact power-of-2 chunks; one padded tile; largest chunk +
     padded remainder. Padding rows sit *above* r0 (dead, already factored rows ->
     harmless to read/write) so they need r0 >= pad. Cost is
-    rows + per_chunk * (#chunks-1); chunks taller than max_chunk are split afterwards.
+    rows + per_chunk * (#chunks-1); chunks taller than max_chunk are split afterwards,
+    but only for blocks with more than split_above active rows (0: always).
     """
+    if split_above and m <= split_above:
+        max_chunk = 1 << 30
     cands = [_chunks(m)]
     mp = _next_pow2(m)
     if mp > m and r0 >= mp - m:
@@ -303,6 +380,26 @@ def isum(x, axis=None):
     """Integer sum kept in int32 (jnp.sum of int32 / bool is int64 under
     jax_enable_x64, which breaks fori_loop carries and index arithmetic in kernels)."""
     return jnp.sum(x, axis=axis, dtype=jnp.int32)
+
+
+@custom_vmap
+def batch_any(x):
+    """``jnp.any(x)`` as the predicate of a lax.cond that decides for the whole batch
+    (the rare singular branches of the det / pf gradients). Frameworks vmap a
+    per-sample function, so inside the vmap every call has B = 1 and the predicate is
+    batched; JAX then turns the cond into a select that evaluates *both* branches on
+    every call (measured on an H200: the det gradient 2.5x slower at n = 8, the pf
+    gradient up to 2x). This reduction's vmap rule reduces over the mapped axis as well,
+    so the predicate stays unbatched and the cond stays a cond. Results are unchanged:
+    the branches agree wherever both are valid (they mask per member), the branch is
+    only chosen for the vmapped batch as a whole -- exactly what a batched call does."""
+    return jnp.any(x)
+
+
+@batch_any.def_vmap
+def _batch_any_vmap(axis_size, in_batched, x):
+    del axis_size, in_batched
+    return jnp.any(x), False
 
 
 def _argmax_chunks(cands, offs):
@@ -443,6 +540,7 @@ __all__ = [
     "OVERRIDE",
     "REGS",
     "KIND_OVERRIDES",
+    "AMPERE_KIND_OVERRIDES",
     "Field",
     "_arch",
     "_tune",

@@ -315,9 +315,12 @@ def test_complex_conventions_match_jnp_linalg(dtype):
     assert relerr(g, 0.5 * np.swapaxes(Sinv, -1, -2)) < rt
 
 
+@pytest.mark.parametrize("n", [32, 96])
 @dtypes
-def test_slogpf_grad(dtype):
-    n = 32
+def test_slogpf_grad(n, dtype):
+    """n = 96 pads to N = 96, an odd multiple of 32: the skew R GEMM of the pf backward
+    (64x64 tiles) then has edge tiles, which its mirrored stores must mask (a regression:
+    they were asserted away, so every n with N % 64 == 32 above 64 failed to trace)."""
     Anon = randn((4, n, n), dtype)
     g = grad_real_sum(lambda a: slogpf(a)[1], jnp.asarray(Anon))
     S = 0.5 * skew(ref64(Anon))
@@ -463,19 +466,27 @@ def test_det_grad_near_singular(n, dtype):
 @pytest.mark.parametrize("n", [4, 8, 14])
 @dtypes
 def test_pf_grad_singular(n, dtype):
-    """Zero row/column (rank n-2), zero matrix, plus a regular member, vs 64-bit minor
-    pfaffians."""
-    B = 3
+    """Zero row/column (rank n-2), zero matrix, two zero rows/columns (still rank n-2:
+    the gradient is the pfaffian of the complementary minor at their crossing, and the
+    factorisation may show two exact zero pivots), plus a regular member, vs 64-bit
+    minor pfaffians."""
+    B = 4
     S = skew(randn((B, n, n), dtype))
     S[0, 3 % n, :] = 0.0
     S[0, :, 3 % n] = 0.0
     S[1] = 0.0
+    S[2, 1, :] = 0.0
+    S[2, :, 1] = 0.0
+    S[2, 3 % n, :] = 0.0
+    S[2, :, 3 % n] = 0.0
     g = grad_real_sum(lambda a: pf(a, skew_symmetrize=False), jnp.asarray(S))
     assert np.all(np.isfinite(g))
     ref = np.stack([pf_gradT64(s) for s in ref64(S)])
     scale = max(np.abs(ref).max(), 1e-30)
     assert np.max(np.abs(g - ref)) < rel_tol(dtype) * scale
     assert np.all(g[1] == 0) and np.abs(ref[0]).max() > 0
+    if n > 4:  # n = 4 with rows 1 and 3 zeroed has pf' = 0 everywhere but (1, 3)
+        assert np.abs(ref[2]).max() > 0
 
 
 def skew_rank_deficient(shape, dtype, gen=None):
@@ -548,3 +559,46 @@ def test_cpu_fallback_warns_and_matches(dtype):
     # from the same unpadded factorisation, so the gradient is bit-identical.
     g2 = grad_real_sum(log_loss, Sd)
     assert np.array_equal(g2, g)
+
+
+# ------------------------------------------------------------ vmap
+@dtypes
+def test_vmap_matches_batched(dtype):
+    """Frameworks vmap a per-sample function, so inside the vmap every fermix call has
+    B = 1 and JAX rebuilds the batch (a leading grid axis for the kernels). The vmapped
+    forward must equal the batched one bit-for-bit and the gradient to round-off (the
+    kernels do the same arithmetic per matrix and the batch-level reductions are
+    explicit pairwise trees; XLA's CPU dots of the generic path re-block with the batch
+    layout, 1e-16), including a batch with exactly singular members, whose rare
+    branches are lax.conds on a batch-level predicate. That predicate goes through
+    _common.batch_any so it stays unbatched under vmap; otherwise the cond becomes a
+    select that evaluates both branches on every call (det gradient 2.5x slower at
+    n = 8 on an H200). The jaxpr check counts the conds that survive vmap."""
+    n = 12
+    gen = np.random.default_rng(5)
+    A = shifted((4, n, n), dtype, 2, gen)
+    A[0, :, 3] = 0.0  # exact zero pivot: det's singular branch
+    S = skew(randn((4, n, n), dtype, gen))
+    S[0, 2, :] = 0.0  # rank n-2: the pf adjugate with one zero pivot
+    S[0, :, 2] = 0.0
+    S[1, 5, :] = 0.0  # two zero rows / columns: pf's lifted second-zero branch
+    S[1, :, 5] = 0.0
+    S[1, 7, :] = 0.0
+    S[1, :, 7] = 0.0
+    cases = [
+        (slogdet, lambda o: o[1], A),
+        (det, lambda o: jnp.real(o), A),
+        (lambda a: slogpf(a, skew_symmetrize=False), lambda o: o[1], S),
+        (lambda a: pf(a, skew_symmetrize=False), lambda o: jnp.real(o), S),
+    ]
+    for f, s, x in cases:
+        x = jnp.asarray(x)
+        for b, v in zip(jax.tree.leaves(f(x)), jax.tree.leaves(jax.vmap(f)(x))):
+            assert np.array_equal(np.asarray(b), np.asarray(v))
+        g = jax.grad(lambda a: jnp.sum(s(f(a))))
+        vg = jax.vmap(jax.grad(lambda a: s(f(a))))
+        gb = np.asarray(g(x))
+        assert np.all(np.isfinite(gb))
+        assert relerr(np.asarray(vg(x)), gb) < tol(dtype, 1e-6, 1e-14)
+        n_cond = lambda fn: str(jax.make_jaxpr(fn)(x)).count(" cond[")
+        assert n_cond(vg) == n_cond(g)

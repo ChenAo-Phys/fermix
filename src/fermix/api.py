@@ -198,7 +198,9 @@ def pf(a, *, prec=None, skew_symmetrize=True, upd_warps=None):
     Differentiable with d pf = sum(G dS), G = pf S^-T / 2 (the Pfaffian adjugate) formed
     from the forward's own Parlett-Reid factors with the smallest pivot isolated, so it
     is accurate to working precision for numerically singular S and finite for exactly
-    singular S: rank n-2 gives the rank-2 adjugate, rank <= n-4 gives 0.
+    singular S: rank n-2 gives the rank-2 adjugate, rank <= n-4 gives 0. Like pf itself
+    the adjugate overflows the 32-bit dtypes for large, badly scaled matrices -- use
+    :func:`slogpf` (whose gradient is S^-T / 2) there.
     """
     a = _prep(a)
     return _pf(a, prec, skew_symmetrize, upd_warps, _use_kernels(a))
