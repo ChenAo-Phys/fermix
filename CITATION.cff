@@ -14,7 +14,7 @@ repository-code: "https://github.com/ChenAo-Phys/fermix"
 url: "https://github.com/ChenAo-Phys/fermix"
 license: MIT
 version: 0.1.0
-date-released: "2026-09-19"
+date-released: "2026-09-26"
 keywords:
   - jax
   - pallas

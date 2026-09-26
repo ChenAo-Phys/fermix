@@ -38,9 +38,9 @@ All functions accept any leading batch dimensions, any matrix size, the four dty
 Forward time per matrix on one H200 GPU against `jnp.linalg.slogdet` and a naive batched Parlett–Reid `slogpf` written in
 jax.numpy (the generic fallback path). The time costs of `det` and `pf` are similar.
 
-![slogdet forward time and speedup over jnp.linalg.slogdet, H200](plots/benchmark_H200_slogdet.png)
+![slogdet forward time and speedup over jnp.linalg.slogdet, H200](https://raw.githubusercontent.com/ChenAo-Phys/fermix/main/plots/benchmark_H200_slogdet.png)
 
-![slogpf forward time and speedup over the naive jax.numpy path, H200](plots/benchmark_H200_slogpf.png)
+![slogpf forward time and speedup over the naive jax.numpy path, H200](https://raw.githubusercontent.com/ChenAo-Phys/fermix/main/plots/benchmark_H200_slogpf.png)
 
 ## Notes and limits
 
