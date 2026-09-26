@@ -234,6 +234,49 @@ def test_rejects_unsupported_dtype(bad):
         slogdet(jnp.eye(4, dtype=bad))
 
 
+def test_rejects_bad_shape_and_block():
+    with pytest.raises(ValueError):
+        slogdet(jnp.zeros((3, 4), jnp.float32))
+    with pytest.raises(ValueError):
+        slogdet(jnp.zeros((5,), jnp.float32))
+    for block in (16, 48, 256):
+        with pytest.raises(ValueError):
+            slogdet(jnp.eye(40, dtype=jnp.float32), block=block)
+        with pytest.raises(ValueError):
+            det(jnp.eye(40, dtype=jnp.float32), block=block)
+
+
+def test_public_kwargs_match_defaults():
+    """The launch-parameter kwargs of the public API (block, unroll_steps, upd_warps)
+    select other kernels for the same arithmetic class; each must return the same
+    values as the default to round-off (float32 only: the kwargs pick kernels, not
+    dtype-specific code)."""
+    n = 72  # two 64-blocks / three 32-blocks, multi-chunk panels
+    gen = np.random.default_rng(21)
+    A = shifted((3, n, n), np.float32, 2, gen)
+    x = jnp.asarray(A)
+    xd = x / 3  # |det| within float32 range (log|det A| ~ 90 at this n)
+    s0, l0 = map(np.asarray, slogdet(x))
+    d0 = np.asarray(det(xd))
+    assert np.all(np.isfinite(d0)) and np.all(d0 != 0)
+    for kw in (dict(block=32), dict(block=64), dict(block=128)):
+        s, l = map(np.asarray, slogdet(x, **kw))
+        assert np.array_equal(s, s0) and np.max(np.abs(l - l0)) < log_tol(np.float32, n)
+        assert relerr(np.asarray(det(xd, **kw)), d0) < rel_tol(np.float32)
+    for unroll in (True, False):
+        s, l = map(np.asarray, slogdet(x, unroll_steps=unroll))
+        assert np.array_equal(s, s0) and np.max(np.abs(l - l0)) < log_tol(np.float32, n)
+    S = jnp.asarray(skew(randn((3, n, n), np.float32, gen)))
+    Sd = S / 3
+    s0, l0 = map(np.asarray, slogpf(S))
+    p0 = np.asarray(pf(Sd))
+    assert np.all(np.isfinite(p0)) and np.all(p0 != 0)
+    for warps in (2, 8):
+        s, l = map(np.asarray, slogpf(S, upd_warps=warps))
+        assert np.array_equal(s, s0) and np.max(np.abs(l - l0)) < log_tol(np.float32, n)
+        assert relerr(np.asarray(pf(Sd, upd_warps=warps)), p0) < rel_tol(np.float32)
+
+
 @dtypes
 def test_prec_option(dtype):
     """prec="ieee" is valid for every dtype; "tf32x3" (tensor-core fp32 block updates)
@@ -602,3 +645,118 @@ def test_vmap_matches_batched(dtype):
         assert relerr(np.asarray(vg(x)), gb) < tol(dtype, 1e-6, 1e-14)
         n_cond = lambda fn: str(jax.make_jaxpr(fn)(x)).count(" cond[")
         assert n_cond(vg) == n_cond(g)
+
+
+# ------------------------------------------------------------ latency mode (large n)
+@dtypes
+def test_latency_mode_forward_and_grad(dtype):
+    """n above Tune.latency_min_n runs the kernels in the latency mode: one power-of-2
+    register tile per block (overhanging the matrix when N is not a power of 2, as
+    here: 1040 -> 1088 / 1056 padded), rolled column steps, dynamic block offsets
+    (one compiled kernel per tile class) and class-sized grids with empty programs.
+    Checks the forward against the 64-bit references, the primal under vjp against the
+    forward bit-for-bit, both gradients against the 64-bit inverse and a vmapped
+    forward against the batched one. (Off the GPU this is the generic path at a large
+    n.)"""
+    n = 1040
+    gen = np.random.default_rng(7)
+    A = randn((2, n, n), dtype, gen)
+    x = jnp.asarray(A)
+    s, l = map(np.asarray, slogdet(x))
+    s64, l64 = np.linalg.slogdet(ref64(A))
+    assert_sign(s, s64, dtype, log_tol(dtype, n))
+    assert np.max(np.abs(l - l64)) < log_tol(dtype, n)
+    for b, v in zip(slogdet(x), jax.vmap(slogdet)(x)):
+        assert np.array_equal(np.asarray(b), np.asarray(v))
+    primal, vjp_fn = jax.vjp(slogdet, x)
+    for direct, under_vjp in zip(slogdet(x), primal):
+        assert np.array_equal(np.asarray(direct), np.asarray(under_vjp))
+    (g,) = vjp_fn((jnp.zeros_like(primal[0]), jnp.ones_like(primal[1])))
+    inv = np.linalg.inv(ref64(A))
+    assert relerr(np.asarray(g), np.swapaxes(inv, -1, -2)) < tol(dtype, 3e-3, 1e-9)
+    S = skew(randn((2, n, n), dtype, gen))
+    y = jnp.asarray(S)
+    f = lambda a: slogpf(a, skew_symmetrize=False)
+    s, l = map(np.asarray, f(y))
+    ref = [pf_ref64(S[i]) for i in range(2)]
+    assert_sign(s, [r[0] for r in ref], dtype, log_tol(dtype, n))
+    assert np.max(np.abs(l - [r[1] for r in ref])) < log_tol(dtype, n)
+    primal, vjp_fn = jax.vjp(f, y)
+    for direct, under_vjp in zip(f(y), primal):
+        assert np.array_equal(np.asarray(direct), np.asarray(under_vjp))
+    (g,) = vjp_fn((jnp.zeros_like(primal[0]), jnp.ones_like(primal[1])))
+    invS = np.linalg.inv(ref64(S))
+    assert relerr(np.asarray(g), 0.5 * np.swapaxes(invS, -1, -2)) < tol(
+        dtype, 3e-3, 1e-9
+    )
+
+
+# ------------------------------------------------------------ 128-column LU block
+@dtypes
+def test_block128_matches_default(dtype):
+    """The 128-column block (16 inner panels: the K = 64 inter-panel update level, the
+    trailing GEMM as two K = 64 slices, the diagonal kernel with 4x the warps) is the
+    default only above n = 2048; force it through the public ``block`` argument at a
+    small n so that the suite exercises it: forward against float64, the vjp primal
+    bit-identical to the forward, the gradient against the inverse."""
+    n = 300  # N = 384 with 128-blocks (three blocks, the last one padded)
+    gen = np.random.default_rng(11)
+    A = randn((3, n, n), dtype, gen)
+    x = jnp.asarray(A)
+    f = lambda a: slogdet(a, block=128)
+    s, l = map(np.asarray, f(x))
+    s64, l64 = np.linalg.slogdet(ref64(A))
+    assert_sign(s, s64, dtype, log_tol(dtype, n))
+    assert np.max(np.abs(l - l64)) < log_tol(dtype, n)
+    primal, vjp_fn = jax.vjp(f, x)
+    for direct, under_vjp in zip(f(x), primal):
+        assert np.array_equal(np.asarray(direct), np.asarray(under_vjp))
+    (g,) = vjp_fn((jnp.zeros_like(primal[0]), jnp.ones_like(primal[1])))
+    inv = np.linalg.inv(ref64(A))
+    assert relerr(np.asarray(g), np.swapaxes(inv, -1, -2)) < tol(dtype, 1e-3, 1e-9)
+
+
+# ------------------------------------------------------------ large-n generic dispatch
+@dtypes
+def test_large_n_generic_dispatch(dtype):
+    """Above the table's lu_generic_above_n slogdet and det run the generic
+    cuSOLVER-based path (det in its "small" mode, which reruns the gradient through
+    the kernels for a batch with an exact zero pivot). Forced here at a small n by a
+    table override: the dispatch contains no Pallas call, the forward matches the
+    64-bit reference, the primal under vjp equals the forward bit-for-bit, and det's
+    gradient is the exact adjugate on singular members."""
+    import dataclasses
+    from fermix import _common
+
+    n = 40
+    kind = {np.float32: "f32", np.float64: "f64"}.get(dtype)
+    kind = kind or {np.complex64: "c64", np.complex128: "c128"}[dtype]
+    base = _common.TUNES[_common._arch()][kind]
+    _common.OVERRIDE = dataclasses.replace(base, lu_generic_above_n=n - 1)
+    try:
+        jax.clear_caches()
+        A = shifted((4, n, n), dtype, 2, np.random.default_rng(9))
+        A[0, :, 3] = 0.0  # zero column: rank n-1, exact zero pivot
+        A[1, :, 0] = 0.0  # two zero columns: rank n-2
+        A[1, :, 1] = 0.0
+        x = jnp.asarray(A)
+        assert "pallas_call" not in str(jax.make_jaxpr(slogdet)(x))
+        s, l = map(np.asarray, slogdet(x))
+        s64, l64 = np.linalg.slogdet(ref64(A))
+        reg = [2, 3]
+        assert_sign(s[reg], s64[reg], dtype, log_tol(dtype, n))
+        assert np.max(np.abs(l[reg] - l64[reg])) < log_tol(dtype, n)
+        assert np.all(np.isneginf(l[:2]))
+        primal, _ = jax.vjp(slogdet, x)
+        for direct, under_vjp in zip(slogdet(x), primal):
+            assert np.array_equal(np.asarray(direct), np.asarray(under_vjp))
+        g = grad_real_sum(det, x)
+        assert np.all(np.isfinite(g))
+        ref = np.stack([adjT64(a) for a in ref64(A)])
+        scale = max(np.abs(ref).max(), 1e-30)
+        assert np.max(np.abs(g - ref)) < rel_tol(dtype) * scale
+        assert np.all(g[1] == 0)
+        assert relerr(g[0], ref[0]) < rel_tol(dtype)
+    finally:
+        _common.OVERRIDE = None
+        jax.clear_caches()

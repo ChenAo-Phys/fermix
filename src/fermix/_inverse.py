@@ -1,6 +1,6 @@
 """A^-T for the derivatives: packed-LU assembly from the forward kernel buffers,
 block-recursive triangular inverse on a sub-block GEMM kernel, transpose + row-permuted
-store; plus a cuSOLVER reference path. Matrix buffers are parts (see _field)."""
+store. Matrix buffers are parts (see _field)."""
 
 import functools
 from typing import Any
@@ -13,31 +13,11 @@ from ._field import where, dot, ld, st, mld, mst, _pcall
 from ._common import _next_pow2, _unit_lower_inv, _upper_inv, _full, _vec, _tune
 from ._lu import _lu_core
 
-_tri_solve = lax.linalg.triangular_solve
 
-
-# ================================================= inverse for the derivative
-def _inverse_cusolver(A):
-    """A^{-1} of (B, n, n) by cuSOLVER pivoted LU + two cuBLAS triangular solves with
-    the permuted identity. Zero pivots are replaced by 1 before the solves and the
-    affected matrices get an all-zero inverse, so an exactly singular input yields
-    finite zeros instead of inf/NaN."""
-    n = A.shape[-1]
-    lu, _, perm = lax.linalg.lu(A)
-    zero = jnp.diagonal(lu, axis1=-2, axis2=-1) == 0
-    singular = jnp.any(zero, axis=-1)
-    lu = lu + zero.astype(A.dtype)[..., None] * jnp.eye(n, dtype=A.dtype)
-    x = jax.nn.one_hot(perm, n, dtype=A.dtype)  # (P I)[c, :] = e_perm[c]
-    x = _tri_solve(lu, x, left_side=True, lower=True, unit_diagonal=True)
-    x = _tri_solve(lu, x, left_side=True, lower=False)
-    return _zero_bad(x, singular)
-
-
-def _zero_bad(x, singular):
-    """Zero the inverse of matrices flagged singular or whose inverse overflowed
-    (subnormal pivots)."""
-    bad = singular | ~jnp.all(jnp.isfinite(x), axis=(-1, -2))
-    return jnp.where(bad[..., None, None], 0.0, x)
+def _off_spec(k):
+    """BlockSpec of a (k,) int32 vector of sub-block offsets (latency mode: the
+    offsets are operands, so all GEMMs of one shape share a compiled kernel)."""
+    return pl.BlockSpec((k,), lambda *idx: (0,))
 
 
 # ========================================== inverse from our own LU factors
@@ -52,30 +32,47 @@ def _rows(M, idx):
 LEAF = 32
 
 
-def _assemble_kernel(p0_ref, p1_ref, idx_ref, out_ref, *, N, b, nb, tm):
+def _assemble_kernel(p0_ref, p1_ref, idx_ref, out_ref, *, N, b, nb, tm, rolled):
     """One row tile [i0, i0+tm) of the packed LU in final pivoted row order. For column
     block k, rows >= r0 are gathered from buffer k%2 by the block's composed row map
     (the rows [r0, r0+b) then hold the pivot rows' panel content, fixed up by
     _diag_kernel), rows < r0 (U rows of earlier blocks) come from the buffer holding
-    their U row block.
+    their U row block. ``rolled`` runs the blocks as a lax.fori_loop over pairs
+    (even block from buffer 0, odd from buffer 1) instead of nb unrolled copies:
+    the same copies, a kernel body independent of nb (latency mode, nb up to 128).
     """
     i0 = pl.program_id(1) * tm
     rows = i0 + lax.broadcasted_iota(jnp.int32, (tm,), 0)
     bufs = (p0_ref, p1_ref)
-    for k in range(nb):
+
+    def block(k, parity):
         r0 = k * b
+        if not isinstance(r0, int):
+            r0 = pl.multiple_of(r0, b)
         cols = pl.ds(r0, b)
-        val = ld(bufs[k & 1], (idx_ref[k, pl.ds(i0, tm)], cols))
-        if r0 > 0:
-            use_other = (rows < r0) & ((((rows // b) + 1) & 1) != (k & 1))
-            oth = mld(bufs[(k + 1) & 1], (pl.ds(i0, tm), cols), mask=use_other[:, None])
+        val = ld(bufs[parity], (idx_ref[k, pl.ds(i0, tm)], cols))
+        if not isinstance(r0, int) or r0 > 0:
+            use_other = (rows < r0) & ((((rows // b) + 1) & 1) != parity)
+            oth = mld(bufs[1 - parity], (pl.ds(i0, tm), cols), mask=use_other[:, None])
             val = where(use_other[:, None], oth, val)
         st(out_ref, (pl.ds(i0, tm), cols), val)
 
+    if not rolled:
+        for k in range(nb):
+            block(k, k & 1)
+        return
 
-def _diag_kernel(
-    lu_ref, araw_ref, out_ref, linv_ref, uinv_ref, *, fld, b, rolled, loop_d
-):
+    def pair(t, carry):
+        block(2 * t, 0)
+        block(2 * t + 1, 1)
+        return carry
+
+    lax.fori_loop(0, nb // 2, pair, 0)
+    if nb % 2:
+        block(nb - 1, (nb - 1) & 1)
+
+
+def _diag_kernel(lu_ref, araw_ref, out_ref, linv_ref, uinv_ref, *, fld, b):
     """Diagonal block k (one program per matrix and block, r0 = k b): the block
     currently holds the pivot rows' panel content (correct L_kk strictly below the
     diagonal, stale above). Rebuild it in 16x16 pieces as L_kk + U_kk with U_kk =
@@ -83,23 +80,24 @@ def _diag_kernel(
     inverses of L_kk / U_kk for the block-recursive inverse (zero pivots treated as 1
     there only).
 
-    ``rolled`` runs the 16x16 triangular substitutions as fori_loops and ``loop_d``
-    the U blocks of one block row as a fori_loop over the column block (the leaf
-    inverses then re-read the U blocks the loop stored): the same arithmetic in a much
-    smaller kernel body -- both are compile-time knobs, results are bit-identical."""
+    The 16x16 triangular substitutions run as fori_loops and the U blocks of one block
+    row in a fori_loop over the column block (the leaf inverses then re-read the U
+    blocks the loop stored): the same arithmetic as unrolled code in a much smaller
+    kernel body (the packed-LU stage compiled in 127 s for complex64 at n = 256
+    unrolled, 4 s this way; results are bit-identical)."""
     del out_ref  # aliased to lu_ref
     s = 16
     q = b // s
     r0 = pl.multiple_of(pl.program_id(1) * b, b)
     ib = lax.broadcasted_iota(jnp.int32, (s, s), 0)
     jb = lax.broadcasted_iota(jnp.int32, (s, s), 1)
-    L, X, U = {}, {}, {}
+    L, X = {}, {}
     for a in range(q):
         for c in range(a + 1):
             L[a, c] = ld(lu_ref, (pl.ds(r0 + a * s, s), pl.ds(r0 + c * s, s)))
     # X = L_kk^-1 by 16x16 block forward substitution
     for a in range(q):
-        X[a, a] = _unit_lower_inv(L[a, a], s, fld, rolled)
+        X[a, a] = _unit_lower_inv(L[a, a], s, fld, rolled=True)
         for c in range(a):
             acc = dot(L[a, c], X[c, c], "ieee")
             for j in range(c + 1, a):
@@ -118,24 +116,15 @@ def _diag_kernel(
         """L strictly below the diagonal, U on and above it, for the block d == a."""
         return where((d == a) & (ib > jb), L[a, a], Ublk)
 
-    if loop_d:
-        for a in range(q):
+    for a in range(q):
 
-            def body(d, carry, a=a):
-                col = pl.multiple_of(d * s, s)
-                blk = diag_tile(a, d, u_block(a, d))
-                st(lu_ref, (pl.ds(r0 + a * s, s), pl.ds(r0 + col, s)), blk)
-                return carry
+        def body(d, carry, a=a):
+            col = pl.multiple_of(d * s, s)
+            blk = diag_tile(a, d, u_block(a, d))
+            st(lu_ref, (pl.ds(r0 + a * s, s), pl.ds(r0 + col, s)), blk)
+            return carry
 
-            lax.fori_loop(a, q, body, 0)
-    else:
-        for a in range(q):
-            for d in range(a, q):
-                U[a, d] = u_block(a, d)
-        for a in range(q):
-            for d in range(a, q):
-                blk = diag_tile(a, d, U[a, d]) if d == a else U[a, d]
-                st(lu_ref, (pl.ds(r0 + a * s, s), pl.ds(r0 + d * s, s)), blk)
+        lax.fori_loop(a, q, body, 0)
     zero16 = fld.zeros((s, s))
     # 32x32 leaves = 16-block pairs (2t, 2t+1); _upper_inv reads only the upper
     # triangle of its argument, so a re-read diagonal block (L below) is fine
@@ -147,38 +136,34 @@ def _diag_kernel(
         st(linv_ref, (t, pl.ds(0, s), pl.ds(s, s)), zero16)
 
     def u_leaves(t, U00, U01, U11):
-        Y00 = _upper_inv(U00, s, fld, rolled)
-        Y11 = _upper_inv(U11, s, fld, rolled)
+        Y00 = _upper_inv(U00, s, fld)
+        Y11 = _upper_inv(U11, s, fld)
         Y01 = -dot(dot(Y00, U01, "ieee"), Y11, "ieee")
         st(uinv_ref, (t, pl.ds(0, s), pl.ds(0, s)), Y00)
         st(uinv_ref, (t, pl.ds(s, s), pl.ds(s, s)), Y11)
         st(uinv_ref, (t, pl.ds(0, s), pl.ds(s, s)), Y01)
         st(uinv_ref, (t, pl.ds(s, s), pl.ds(0, s)), zero16)
 
-    if loop_d:
-        # the leaf inverses read back the U blocks the loops stored (a store phase
-        # re-read in the same kernel needs the barrier), one fori_loop over the pairs
-        plgpu.debug_barrier()
+    # the leaf inverses read back the U blocks the loops stored (a store phase
+    # re-read in the same kernel needs the barrier), one fori_loop over the pairs
+    plgpu.debug_barrier()
 
-        def leaf_body(t, carry):
-            row0 = pl.multiple_of(r0 + t * (2 * s), 2 * s)
-            U00 = ld(lu_ref, (pl.ds(row0, s), pl.ds(row0, s)))
-            U01 = ld(lu_ref, (pl.ds(row0, s), pl.ds(row0 + s, s)))
-            U11 = ld(lu_ref, (pl.ds(row0 + s, s), pl.ds(row0 + s, s)))
-            u_leaves(t, U00, U01, U11)
-            return carry
+    def leaf_body(t, carry):
+        row0 = pl.multiple_of(r0 + t * (2 * s), 2 * s)
+        U00 = ld(lu_ref, (pl.ds(row0, s), pl.ds(row0, s)))
+        U01 = ld(lu_ref, (pl.ds(row0, s), pl.ds(row0 + s, s)))
+        U11 = ld(lu_ref, (pl.ds(row0 + s, s), pl.ds(row0 + s, s)))
+        u_leaves(t, U00, U01, U11)
+        return carry
 
-        lax.fori_loop(0, q // 2, leaf_body, 0)
-    else:
-        for t in range(q // 2):
-            a0, a1 = 2 * t, 2 * t + 1
-            u_leaves(t, U[a0, a0], U[a0, a1], U[a1, a1])
+    lax.fori_loop(0, q // 2, leaf_body, 0)
 
 
-def _packed_lu(fac, fld):
+def _packed_lu(fac, fld, lat=False):
     """Packed LU (unit L strictly below, U on/above the diagonal) in final pivoted row
     order from the forward kernels' buffers, g0 with (P A)[c] = A[g0[c]], and the 32x32
-    leaf inverses (B, N/32, 32, 32) of L and U; the matrices as parts.
+    leaf inverses (B, N/32, 32, 32) of L and U; the matrices as parts. lat: latency
+    mode (the assembly kernel loops over the blocks instead of unrolling them).
 
     Block k's panel (columns [r0, r0+b)) stays in buffer k%2 with rows in that block's
     pre-pivot order; the pivot rows carry correct L entries left of their pivot column
@@ -197,20 +182,20 @@ def _packed_lu(fac, fld):
         Sk = jnp.concatenate([ar[:, :r0], pivs[k], srcs[k][:, r0 + b :]], axis=1)
         g = jnp.take_along_axis(Sk, g, axis=1)
         gs[k] = g
-    rows_k = lambda k: jnp.concatenate([ar[:, : k * b], gs[k][:, k * b :]], axis=1)
-    idx = jnp.stack([rows_k(k) for k in range(nb)], axis=1)  # (B, nb, N)
     # (B, nb, b, b) per component
     araw = tuple(
         jnp.stack([_rows(snaps[k][c], pivs[k] - k * b) for k in range(nb)], axis=1)
         for c in range(fld.k)
     )
-    tm = 64 if N % 64 == 0 else 32
     nleaf = N // LEAF
+    rows_k = lambda k: jnp.concatenate([ar[:, : k * b], gs[k][:, k * b :]], axis=1)
+    idx = jnp.stack([rows_k(k) for k in range(nb)], axis=1)  # (B, nb, N)
+    tm = 64 if N % 64 == 0 else 32
     idx_spec = pl.BlockSpec((None, nb, N), lambda bi, i: (bi, 0, 0))
     ins = [(bufs[0], _full(N)), (bufs[1], _full(N)), (idx, idx_spec)]
     outs = [(fld.structs((B, N, N)), _full(N))]
     (LU,) = _pcall(
-        functools.partial(_assemble_kernel, N=N, b=b, nb=nb, tm=tm),
+        functools.partial(_assemble_kernel, N=N, b=b, nb=nb, tm=tm, rolled=lat),
         ins,
         outs,
         (B, N // tm),
@@ -224,14 +209,14 @@ def _packed_lu(fac, fld):
     outs = [(fld.structs((B, N, N)), _full(N)), (leaf, leaf_spec), (leaf, leaf_spec)]
     t = _tune(fld.kind)
     LU, Lleaf, Uleaf = _pcall(
-        functools.partial(
-            _diag_kernel, fld=fld, b=b, rolled=t.diag_rolled, loop_d=t.diag_loop_d
-        ),
+        functools.partial(_diag_kernel, fld=fld, b=b),
         ins,
         outs,
         (B, nb),
         aliases={0: 0},
-        num_warps=t.diag_warps,
+        # the 128-block holds (b/16)^2 = 64 register tiles of 16x16 instead of 16:
+        # spread them over 4x the warps
+        num_warps=t.diag_warps * max(1, (b // 64) ** 2),
     )
     return LU, gs[0], Lleaf, Uleaf
 
@@ -275,6 +260,10 @@ def _bgemm_kernel(
     below the diagonal are computed, the ones above are their negated transposes
     (edge tiles, when M is not a multiple of tm, are masked in both stores)."""
     a_ref, b_ref, out_ref = refs[ia], refs[ib], refs[-1]
+    if ra is None:
+        # latency mode: the six offsets come as an operand (multiples of the leaf)
+        off_ref = refs[-2]
+        ra, ca, rb, cb, rc, cc = (pl.multiple_of(off_ref[j], LEAF) for j in range(6))
     geom = dict(ra=ra, ca=ca, rb=rb, cb=cb, K=K, tm=tm, tn=tn, tk=tk, prec=prec)
     _bgemm_tile = _bgemm_tile_factory(fld, ta=ta, tb=tb, **geom)
     i0 = pl.program_id(1) * tm
@@ -285,7 +274,7 @@ def _bgemm_kernel(
     rvalid = (i0 + ri) < M
     cvalid = (j0 + cj) < Nn
     if skew:
-        assert tm == tn and beta == 0.0 and rc == cc
+        assert tm == tn and beta == 0.0
 
         def lower():
             acc = _bgemm_tile(a_ref, b_ref, i0, j0, rvalid, cvalid, full)
@@ -327,7 +316,6 @@ def _bgemm_kernel(
 def _bgemm_tile_factory(fld, ra, ca, rb, cb, K, tm, tn, tk, prec, ta, tb):
     """The K loop of one output tile of _bgemm_kernel (closure over the static
     geometry), returning acc = A_blk[i0:i0+tm, :] @ B_blk[:, j0:j0+tn]."""
-    three = _tune(fld.kind).cplx_dot3
 
     def tile(a_ref, b_ref, i0, j0, rvalid, cvalid, full):
         def body(t, acc):
@@ -354,7 +342,7 @@ def _bgemm_tile_factory(fld, ra, ca, rb, cb, K, tm, tn, tk, prec, ta, tb):
                 Ab = Ab.T
             if tb:
                 Bb = Bb.T
-            return acc + dot(Ab, Bb, prec, three)
+            return acc + dot(Ab, Bb, prec)
 
         return lax.fori_loop(0, K // tk, body, fld.zeros((tm, tn)))
 
@@ -383,6 +371,7 @@ def _bgemm(
     ta: Any = False,  # bool; Any because callers unpack mixed-type **dims dicts
     tb: Any = False,
     skew: Any = False,
+    dyn: Any = False,
 ):
     """Batched sub-block GEMM on (B, ., .) parts: out[rc:rc+M, cc:cc+Nn] = beta*out +
     alpha * A_blk @ B_blk with A = arrays[ia][ra:ra+M, ca:ca+K],
@@ -392,9 +381,16 @@ def _bgemm(
     kernels address the sub-blocks directly. ta / tb: use the transpose of the stored
     block arrays[ia][ra:ra+K, ca:ca+M] / arrays[ib][rb:rb+Nn, cb:cb+K] instead. skew: a
     skew-symmetric square product (fresh output), computed on and below the diagonal
-    only and mirrored (half the tensor-core work)."""
+    only and mirrored (half the tensor-core work). dyn: pass the offsets as an operand
+    (latency mode), so that the GEMMs of one shape compile once."""
     Bn = arrays[0][0].shape[0]
     t = _tune(fld.kind)
+    offsets = dict(ra=ra, ca=ca, rb=rb, cb=cb, rc=rc, cc=cc)
+    extra = []
+    if dyn:
+        assert all(v % LEAF == 0 for v in offsets.values())
+        extra = [(jnp.array(list(offsets.values()), jnp.int32), _off_spec(6))]
+        offsets = dict.fromkeys(offsets, None)
     if skew:
         assert M == Nn and ic is None and beta == 0.0
         tm = tn = min(t.inv_tile, _next_pow2(M))
@@ -404,7 +400,6 @@ def _bgemm(
         tn = min(t.inv_tile, _next_pow2(Nn))
     tk = min(t.inv_tk, K)
     shapes = dict(M=M, Nn=Nn, K=K, tm=tm, tn=tn, tk=tk)
-    offsets = dict(ra=ra, ca=ca, rb=rb, cb=cb, rc=rc, cc=cc)
     scale = dict(alpha=alpha, beta=beta, prec=prec, ta=ta, tb=tb, skew=skew)
     kern = functools.partial(
         _bgemm_kernel, fld=fld, ia=ia, ib=ib, **shapes, **offsets, **scale
@@ -416,7 +411,7 @@ def _bgemm(
         return pl.BlockSpec(block, index)
 
     oshape = (Bn, M, Nn) if ic is None else arrays[ic][0].shape
-    ins = [(a, spec(a[0].shape)) for a in arrays]
+    ins = [(a, spec(a[0].shape)) for a in arrays] + extra
     outs = [(fld.structs(oshape), spec(oshape))]
     grid = (Bn, -(-M // tm), -(-Nn // tn))
     aliases = None if ic is None else {ic: 0}
@@ -431,10 +426,11 @@ def _bgemm(
     )[0]
 
 
-def _inv_unit_lower(LU, Lleaf, prec, fld, leaf=LEAF):
+def _inv_unit_lower(LU, Lleaf, prec, fld, leaf=LEAF, dyn=False):
     """L^-1 (B, N, N) of the unit lower-triangular L packed in LU: block-diagonal leaf
     inverses Lleaf (B, k, s, s), then per node X21 = -X22 L21 X11 written in place (two
-    sub-block GEMMs). Only strictly-lower blocks of LU are read."""
+    sub-block GEMMs). Only strictly-lower blocks of LU are read. dyn: GEMM offsets as
+    operands (latency mode; the nodes of one level then share their kernels)."""
     B, N, _ = LU[0].shape
     k = N // leaf
     eye = jnp.eye(k, dtype=fld.real)
@@ -447,18 +443,18 @@ def _inv_unit_lower(LU, Lleaf, prec, fld, leaf=LEAF):
         X = rec(X, i0, h)
         X = rec(X, i0 + h, m - h)
         at_t = dict(ra=i0 + h, ca=i0 + h, rb=i0 + h, cb=i0, rc=0, cc=0)
-        dims_t = dict(M=m - h, K=m - h, Nn=h, prec=prec, fld=fld)
+        dims_t = dict(M=m - h, K=m - h, Nn=h, prec=prec, fld=fld, dyn=dyn)
         T = _bgemm((X, LU), 0, 1, None, **at_t, **dims_t)
         at_x = dict(ra=0, ca=0, rb=i0, cb=i0, rc=i0 + h, cc=i0)
-        dims = dict(M=m - h, K=h, Nn=h, alpha=-1.0, prec=prec, fld=fld)
+        dims = dict(M=m - h, K=h, Nn=h, alpha=-1.0, prec=prec, fld=fld, dyn=dyn)
         return _bgemm((T, X), 0, 1, 1, **at_x, **dims)
 
     return rec(X, 0, N)
 
 
-def _solve_upper(LU, Y, Uleaf, prec, fld, leaf=LEAF):
+def _solve_upper(LU, Y, Uleaf, prec, fld, leaf=LEAF, dyn=False):
     """U X = Y in place on the row blocks of Y (B, N, R) for the upper-triangular U
-    packed in LU; Uleaf[:, i] = U_ii^-1."""
+    packed in LU; Uleaf[:, i] = U_ii^-1. dyn as in _inv_unit_lower."""
     N = LU[0].shape[-1]
     R = Y[0].shape[-1]
 
@@ -466,13 +462,13 @@ def _solve_upper(LU, Y, Uleaf, prec, fld, leaf=LEAF):
         if m == leaf:
             Uinv = tuple(Uc[:, i0 // leaf] for Uc in Uleaf)
             at = dict(ra=0, ca=0, rb=i0, cb=0, rc=i0, cc=0)
-            dims = dict(M=leaf, K=leaf, Nn=R, prec=prec, fld=fld)
+            dims = dict(M=leaf, K=leaf, Nn=R, prec=prec, fld=fld, dyn=dyn)
             return _bgemm((Uinv, Y), 0, 1, 1, **at, **dims)
         h = _split(m)
         Y = rec(Y, i0 + h, m - h)
         at = dict(ra=i0, ca=i0 + h, rb=i0 + h, cb=0, rc=i0, cc=0)
         dims = dict(M=h, K=m - h, Nn=R, alpha=-1.0, beta=1.0, prec=prec, fld=fld)
-        Y = _bgemm((LU, Y), 0, 1, 1, **at, **dims)
+        Y = _bgemm((LU, Y), 0, 1, 1, **at, **dims, dyn=dyn)
         return rec(Y, i0, h)
 
     return rec(Y, 0, N)
@@ -518,12 +514,13 @@ def _lu_parts(A, n, fld, prec, unroll_steps, block, zero_singular=True):
     block=None takes the architecture table's choice, the same as the forward
     (_lu_block), so that (sign, logabs) matches it bit-for-bit."""
     sign, logabs, fac = _lu_core(A, n, fld, prec, unroll_steps, block, factors=True)
-    LU, g0, Lleaf, Uleaf = _packed_lu(fac, fld)
+    lat = n > _tune(fld.kind).latency_min_n  # as in _lu_core
+    LU, g0, Lleaf, Uleaf = _packed_lu(fac, fld, lat)
     zero = jnp.ones(LU[0].shape[:2], bool)
     for Lc in LU:
         zero = zero & (jnp.diagonal(Lc, axis1=1, axis2=2) == 0)
-    Linv = _inv_unit_lower(LU, Lleaf, prec, fld)
-    Z = _solve_upper(LU, Linv, Uleaf, prec, fld)  # U~^-1 L^-1
+    Linv = _inv_unit_lower(LU, Lleaf, prec, fld, dyn=lat)
+    Z = _solve_upper(LU, Linv, Uleaf, prec, fld, dyn=lat)  # U~^-1 L^-1
     bad = jnp.zeros(LU[0].shape[0], bool)
     for Zc in Z:
         bad = bad | ~jnp.all(jnp.isfinite(Zc), axis=(1, 2))
@@ -532,7 +529,3 @@ def _lu_parts(A, n, fld, prec, unroll_steps, block, zero_singular=True):
     bad_i32 = bad.astype(jnp.int32)[:, None]
     invT = fld.join(_permT(Z, g0, bad_i32, n, fld))  # P^T Z^T, leading n x n
     return sign, logabs, invT, LU, g0, zero
-
-
-# "lu": our LU kernels + GEMM recursion (default); "cusolver": cuSOLVER LU + cuBLAS trsm
-GRAD_INVERSE = "lu"

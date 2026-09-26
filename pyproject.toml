@@ -1,5 +1,6 @@
 [build-system]
-requires = ["setuptools>=64", "wheel"]
+# setuptools >= 77 for the PEP 639 license expression below
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -8,13 +9,18 @@ version = "0.1.0"
 description = "Fast batched real and complex determinants and Pfaffians on GPU with JAX/Pallas kernels, with singular-safe gradients"
 readme = "README.md"
 requires-python = ">=3.11"
-license = { file = "LICENSE" }
-authors = [{ name = "Ao Chen" }]
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Ao Chen", email = "aochen@caltech.edu" }]
 keywords = ["jax", "pallas", "determinant", "pfaffian", "gpu", "variational monte carlo"]
 classifiers = [
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Topic :: Scientific/Engineering :: Physics",
     "Environment :: GPU :: NVIDIA CUDA",
+    "Operating System :: POSIX :: Linux",
 ]
 # jax 0.7.1 is the first release exporting pallas.triton.load / .store, which the
 # kernels use for masked access; older jax cannot run them.
@@ -23,6 +29,11 @@ dependencies = ["jax>=0.7.1", "numpy"]
 [project.optional-dependencies]
 test = ["pytest"]
 dev = ["pytest", "black", "pyright"]
+
+[project.urls]
+Homepage = "https://github.com/ChenAo-Phys/fermix"
+Repository = "https://github.com/ChenAo-Phys/fermix"
+Issues = "https://github.com/ChenAo-Phys/fermix/issues"
 
 [tool.setuptools.packages.find]
 where = ["src"]

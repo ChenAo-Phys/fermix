@@ -9,7 +9,6 @@ import functools
 import jax
 import jax.numpy as jnp
 from jax import lax
-from . import _inverse
 from ._fallback import (
     _lu_parts_generic,
     _pairwise,
@@ -68,7 +67,7 @@ def _parts(A, n, fld, prec, unroll_steps, block, fast, zero_singular=True):
         sign, logabs, invT, LU, g0, zero = _lu_parts_generic(A, N, zero_singular)
         return sign, logabs, invT, fld.split(LU), g0, zero
 
-    if fast and _inverse.GRAD_INVERSE == "lu":
+    if fast:
         b = _lu_block(n, _tune(fld.kind)) if block is None else block
         N = -(-n // b) * b  # the kernels pad to the block size
         kernels = lambda A: _lu_parts(
@@ -175,14 +174,6 @@ def _perm_sign(g0, dt):
         p = jnp.take_along_axis(p, p, axis=1)
     ncyc = isum(lab == idx, axis=1)
     return (1.0 - 2.0 * ((N - ncyc) % 2)).astype(dt)
-
-
-def _diag_zero(LU):
-    """Zero-pivot mask of a packed LU given as parts."""
-    zero = jnp.ones(LU[0].shape[:2], bool)
-    for Lc in LU:
-        zero = zero & (jnp.diagonal(Lc, axis1=1, axis2=2) == 0)
-    return zero
 
 
 def _diag(LU, fld):

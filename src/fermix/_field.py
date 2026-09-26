@@ -9,6 +9,7 @@ components (length 1 or 2); a matrix buffer of the field is always handled as pa
 (``tuple[Array, ...]``) and enters a kernel as a tuple of refs."""
 
 import dataclasses
+import functools
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -31,7 +32,7 @@ KINDS = {
 @tree_util.register_pytree_node_class
 class CVal:
     """A complex value as two real arrays; supports the arithmetic the kernels use
-    (+, -, unary -, * by a CVal / real array / scalar, indexing, .T, conj)."""
+    (+, -, unary -, * by a CVal / real array / scalar, indexing, .T)."""
 
     __slots__ = ("re", "im")
 
@@ -65,9 +66,6 @@ class CVal:
     @property
     def T(self):
         return CVal(self.re.T, self.im.T)
-
-    def conj(self):
-        return CVal(self.re, -self.im)
 
     def __neg__(self):
         return CVal(-self.re, -self.im)
@@ -172,19 +170,11 @@ def unit(x):
     return jnp.sign(x)
 
 
-def conj(x):
-    return x.conj() if isinstance(x, CVal) else x
-
-
-def transpose(x):
-    return x.T
-
-
-def dot(a, b, prec, three=False):
-    """a @ b on register tiles: one Triton dot for real values; for complex ones four
-    real dots (or Gauss' three-multiplication form with ``three=True``: 25 % fewer
-    tensor-core passes, one extra rounding). ``prec`` names the fp32 dot algorithm
-    ("tf32x3" / "ieee"); float64 dots always run in IEEE fp64."""
+def dot(a, b, prec):
+    """a @ b on register tiles: one Triton dot for real values, four real dots for
+    complex ones (Gauss' three-multiplication form measured slower: the extra
+    full-tile adds cost more than the saved tensor-core pass). ``prec`` names the fp32
+    dot algorithm ("tf32x3" / "ieee"); float64 dots always run in IEEE fp64."""
     if isinstance(a, CVal) or isinstance(b, CVal):
         ar, ai = (a.re, a.im) if isinstance(a, CVal) else (a, None)
         br, bi = (b.re, b.im) if isinstance(b, CVal) else (b, None)
@@ -194,9 +184,6 @@ def dot(a, b, prec, three=False):
             return CVal(dot(ar, br, prec), dot(ai, br, prec))
         rr = dot(ar, br, prec)
         ii = dot(ai, bi, prec)
-        if three:
-            mixed = dot(ar + ai, br + bi, prec)
-            return CVal(rr - ii, mixed - rr - ii)
         return CVal(rr - ii, dot(ar, bi, prec) + dot(ai, br, prec))
     rdt = jnp.result_type(a)
     precision = PREC[prec] if rdt == jnp.float32 else lax.Precision.HIGHEST
@@ -267,10 +254,6 @@ class Field:
         if self.cplx:
             return lax.complex(p[0], p[1])
         return p[0]
-
-    def value(self, A):
-        """A jnp array of the field -> a value (CVal for complex)."""
-        return from_parts(self.split(A))
 
     def structs(self, shape):
         """Parts-shaped output spec: k ShapeDtypeStructs of the component dtype."""
@@ -362,6 +345,15 @@ def _flatten(items):
     return flat, specs, groups
 
 
+def _kernel_name(kernel):
+    """The kernel function's name (through functools.partial layers) for the
+    pallas_call, so that profiles (nsys) show which kernel a launch is instead of
+    the wrapper's name."""
+    while isinstance(kernel, functools.partial):
+        kernel = kernel.func
+    return getattr(kernel, "__name__", "fermix_kernel")
+
+
 def _pcall(kernel, ins, outs, grid, *, aliases=None, num_warps, num_stages=1):
     """pallas_call over logical arguments. ``ins`` = [(array | parts, BlockSpec), ...],
     ``outs`` = [(ShapeDtypeStruct | tuple of them, BlockSpec), ...]; a parts tuple
@@ -384,6 +376,7 @@ def _pcall(kernel, ins, outs, grid, *, aliases=None, num_warps, num_stages=1):
 
     res = pl.pallas_call(
         wrapped,
+        name=_kernel_name(kernel),
         grid=grid,
         in_specs=in_specs,
         out_specs=out_specs,
@@ -411,7 +404,6 @@ __all__ = [
     "iszero",
     "recip",
     "unit",
-    "conj",
     "dot",
     "ld",
     "st",

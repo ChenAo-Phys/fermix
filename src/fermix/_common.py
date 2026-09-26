@@ -32,6 +32,13 @@ class Tune:
     lu_block_small: int = 32
     lu_block_large: int = 64
     lu_block_switch: int = 256
+    # a third, 128-column block (16 inner panels, one more K = 64 level in the
+    # inter-panel update, the trailing GEMM as two K = 64 dots) for n above
+    # lu_block_switch_huge: at large n and a batch that fills the GPU the trailing
+    # rank-b update is bound by its C read + write per block (H200, n = 4096, B = 64:
+    # 76 % of slogdet's kernel time at 34 TFLOPs / 2.1 TB/s), which b = 128 halves
+    lu_block_huge: int = 128
+    lu_block_switch_huge: int = 2048
     # unroll the 8 column steps of the LU inner panel (Python loop) for n up to this;
     # above it a lax.fori_loop (smaller kernel body: +2-4 % on H200 for n >= 192, -5 %
     # at n = 128)
@@ -41,12 +48,12 @@ class Tune:
     # warps are pure overhead)
     lu_chunk_cost: int = 64
     pf_chunk_cost: int = 512
-    # split register row-chunks taller than this (power of 2; smaller chunks halve the
-    # reduction temporaries of a step at the price of more partial reductions);
-    # pf_split_above > 0 applies the pf split only to blocks with more active rows
-    # than that (the c128 pf panel on Ampere spills from 768 rows: 256-row chunks are
-    # 1.5x there, but a lone 512-row block is 0.91x when split)
-    lu_max_chunk: int = 1 << 30
+    # pf panel: split register row-chunks taller than this (power of 2; smaller
+    # chunks halve the reduction temporaries of a step at the price of more partial
+    # reductions), only for blocks with more active rows than pf_split_above (0:
+    # always). Used by complex128 on Ampere, whose pf panel spills from 768 rows:
+    # 256-row chunks are 1.5x there, but a lone 512-row block is 0.91x when split.
+    # (The LU panel never gains from splitting: 0.64-0.95x wherever measured.)
     pf_max_chunk: int = 1 << 30
     pf_split_above: int = 0
     # panel kernels: 1 warp per matrix up to panel_rows_1w active rows (warp-shuffle
@@ -95,24 +102,12 @@ class Tune:
     # warps of the packed-LU diagonal kernel (register-resident 16x16 block
     # substitution; 1 warp holds the float32 tiles, wider values need more warps)
     diag_warps: int = 1
-    # run the diagonal kernel's 16x16 triangular substitutions as lax.fori_loops
-    # instead of unrolled code: bit-identical results, runtime 0.97-1.08x (H200), and
-    # the packed-LU stage compiles in 4-14 s instead of 14 s (f32) / 128 s (c64) /
-    # 259 s (c128) at n = 256
-    diag_rolled: bool = True
-    # compute the U blocks of a block row in a fori_loop over the column block (and
-    # re-read them for the leaf inverses) instead of 20 unrolled dot chains: same
-    # arithmetic, the diagonal kernel's compile time halves again
-    diag_loop_d: bool = True
-    # complex dots as Gauss' three real dots instead of four (fewer tensor-core
-    # passes, one extra rounding); no effect on real kinds
-    cplx_dot3: bool = False
     # slogdet uses the generic LU path (cuSOLVER's batched getrf, the call
     # jnp.linalg.slogdet makes, plus XLA triangular solves for the gradient) for
     # n <= this: a single 32-block costs the kernels 5 launches (~0.17 ms at
     # B = 4096 on an H200 whatever n), which cuSOLVER beats up to n = 32; from two
     # blocks on the kernels win. The forward and the gradient share the choice. det
-    # is exempt (its singular-input gradient needs an exact LU, see api._lu_kernels).
+    # has its own limit, det_generic_max_n below.
     lu_generic_max_n: int = 32
     # det uses the generic LU the same way for n <= this ("small" mode in _diff): the
     # forward and the regular gradient come from cuSOLVER's batched LU, and only a batch
@@ -122,9 +117,31 @@ class Tune:
     # jnp.linalg.det's cofactor solve by 10-40 %; the Hopper values follow its slogdet
     # crossovers (det itself unmeasured there).
     det_generic_max_n: int = 32
-    # pf backward: compute R = Y^T D~^-1 Y (skew-symmetric) on and below the diagonal
-    # only and mirror the tiles (half the GEMM work of the pf gradient's largest step)
-    pf_skew_r: bool = True
+    # ... and again above this n (slogdet and det alike): at large n the wide kinds'
+    # register panels spill, and single-matrix cuSOLVER -- which jax runs per matrix
+    # at these sizes, batched or vmapped -- beats the kernels even with a batch that
+    # fills the GPU (2026-09-23 sweeps, `benchmark_data.md` §17: e.g. c128 n = 4096
+    # 0.55x on an H200 / 0.50x on an A100-80GB, f64 n = 8192 0.53x / n = 6144 0.62x).
+    # Chosen from n alone like every dispatch (B is 1 at trace time under vmap).
+    lu_generic_above_n: int = 1 << 30
+    # latency mode for n above this: matrices of that size come in small batches (a
+    # few dozen 8192^2 float32 matrices fill an 80 GB GPU), so one panel program per
+    # matrix sits alone on its SM and the panels' *latency* per column is the cost,
+    # not their throughput. The panels then run on one power-of-2 register tile per
+    # block (a chunked layout costs 1.4x at B = 1, measured on the A100 at n = 2048;
+    # rows past n are masked), with rolled column steps (the unrolled body spills at
+    # 8 warps: rolled is 1.25x at n = 1024, B = 1), warps from the lat_* ladder below
+    # and dynamic block offsets, so that all blocks of one tile class share one
+    # compiled kernel (the compile time of n = 2048 was 4 min with a kernel per block)
+    latency_min_n: int = 1024
+    # latency mode warps: 4 up to lat_rows_4w tile rows, 8 up to lat_rows_8w, 16 up to
+    # lat_rows_16w, 32 above (the LU inner panel and the pf pair-step panel)
+    lat_rows_4w: int = 512
+    lat_rows_8w: int = 2048
+    lat_rows_16w: int = 4096
+    pf_lat_rows_4w: int = 256
+    pf_lat_rows_8w: int = 1024
+    pf_lat_rows_16w: int = 2048
 
 
 def _derive(base, regs, **over):
@@ -140,6 +157,9 @@ def _derive(base, regs, **over):
     def rows(v):
         return v if v >= big else max(64, v // regs)
 
+    def lat(v):
+        return rows(v) if regs >= 4 else v
+
     t = dataclasses.replace(
         base,
         panel_rows_1w=rows(base.panel_rows_1w),
@@ -150,6 +170,17 @@ def _derive(base, regs, **over):
         pf_panel_rows_2w=rows(base.pf_panel_rows_2w),
         pf_panel_rows_4w=rows(base.pf_panel_rows_4w),
         pf_panel_rows_8w=rows(base.pf_panel_rows_8w),
+        # latency-mode ladders (Perlmutter A100 measurements, B = 1): complex128 needs
+        # the register-scaled ladders (its 2048-row tile on 8 warps is 256 registers of
+        # W per thread: slogdet n = 2048 127 ms vs 77 with 32 warps, n = 3072 219 vs 194),
+        # whereas float64 / complex64 are best on the float32 ladders (32 warps on
+        # their 4096-row tile is 0.85x, and the pf panel prefers 16 warps at 2048 rows)
+        lat_rows_4w=lat(base.lat_rows_4w),
+        lat_rows_8w=lat(base.lat_rows_8w),
+        lat_rows_16w=lat(base.lat_rows_16w),
+        pf_lat_rows_4w=lat(base.pf_lat_rows_4w),
+        pf_lat_rows_8w=lat(base.pf_lat_rows_8w),
+        pf_lat_rows_16w=lat(base.pf_lat_rows_16w),
         inv_tm_big=max(64, base.inv_tm_big // regs),
         diag_warps=regs,
     )
@@ -177,6 +208,7 @@ REGS = {"f32": 1, "f64": 2, "c64": 2, "c128": 4}
 #   (the gradient's crossover is a little lower, but it shares the forward's path).
 KIND_OVERRIDES = {
     "f64": dict(
+        lu_generic_above_n=6144,
         lu_generic_max_n=40,
         det_generic_max_n=40,
         lu_unroll_max_n=0,
@@ -188,19 +220,27 @@ KIND_OVERRIDES = {
         pf_tn=32,
         diag_warps=1,
     ),
+    # the complex kinds take the 128-block only above n = 6144: with two K = 64 complex
+    # dots per trailing-GEMM tile c64 slogdet at n = 3072 / 4096 read 234 / 280 ms vs
+    # 181 / 224 with 64-blocks on the H200 (2026-09-23; c128 415 / 548 vs 401 / 525),
+    # while at n = 8192 it is 588 vs 752 (c128 1316 vs 1531)
     "c64": dict(
+        lu_generic_above_n=6144,
         lu_generic_max_n=48,
         det_generic_max_n=48,
         lu_unroll_max_n=0,
+        lu_block_switch_huge=6144,
         panel_rows_1w=128,
         panel_rows_2w=256,
         panel_rows_4w=512,
         diag_warps=1,
     ),
     "c128": dict(
+        lu_generic_above_n=3072,
         lu_generic_max_n=48,
         det_generic_max_n=48,
         lu_unroll_max_n=0,
+        lu_block_switch_huge=6144,
         lu_gemm_tm=32,
         lu_gemm_tn=64,
         panel_rows_1w=64,
@@ -233,9 +273,13 @@ KIND_OVERRIDES = {
 #   f64 1.01 / 1.08 / 1.05, c64 1.01 / 1.02 / 1.04, c128 1.00 / 1.03 / 1.03; bit-identical);
 # - the c128 inverse (grad) knobs are all <= 1.0: table kept.
 AMPERE_KIND_OVERRIDES = {
-    "f32": {},
+    # pf update 8-tile loop: 1.15x at n = 4096 B = 16 on the local A100 (2026-09-23,
+    # interleaved, bit-identical); the wide kinds had it since 2026-09-19
+    "f32": dict(pf_upd_nt=8),
     "f64": dict(
         KIND_OVERRIDES["f64"],
+        lu_generic_above_n=4096,
+        lu_block_switch_huge=2048,
         pf_upd_nt=8,
         lu_generic_max_n=32,
         det_generic_max_n=32,
@@ -251,6 +295,7 @@ AMPERE_KIND_OVERRIDES = {
     # fix the c64 crossover is 48 (forward 2.0 vs 2.0 ms at n = 48, gradient 4.3 vs 3.7)
     "c64": dict(
         KIND_OVERRIDES["c64"],
+        lu_block_switch_huge=1 << 30,
         pf_upd_nt=8,
         lu_gemm_tm=32,
         lu_gemm_tn=64,
@@ -262,6 +307,7 @@ AMPERE_KIND_OVERRIDES = {
     ),
     "c128": dict(
         KIND_OVERRIDES["c128"],
+        lu_block_switch_huge=1 << 30,
         pf_upd_nt=8,
         lu_gemm_nt=4,
         pf_panel_rows_1w=32,
@@ -293,7 +339,10 @@ def _table(f32, overrides=KIND_OVERRIDES):
 # Ampere table untested (they address register pressure, not the architecture).
 # See CLAUDE.local.md for the measurements.
 TUNES = {
-    "ampere": _table(Tune(), AMPERE_KIND_OVERRIDES),
+    # Ampere: no 128-block for the 3xTF32 kinds -- on an A100-80GB the two K = 64
+    # float32 dot slices per trailing-GEMM tile hit a cliff (slogdet n = 4096 B = 32
+    # 2355 ms vs 209 with 64-blocks, 2026-09-23); float64 keeps it above n = 2048
+    "ampere": _table(Tune(lu_block_switch_huge=1 << 30), AMPERE_KIND_OVERRIDES),
     "hopper": _table(
         Tune(
             lu_block_switch=128,
@@ -301,6 +350,12 @@ TUNES = {
             lu_gemm_nt=4,
             pf_panel_rows_1w=128,
             pf_panel_rows_2w=256,
+            # H200, n = 4096, B = 64 (2026-09-23): the 8-tile loop of the pf update
+            # is 1.34x (4 tiles 1.28x); at n <= 512 it had measured 0.99-1.03
+            pf_upd_nt=8,
+            # with the 128-block (two K = 64 dots per trailing-GEMM tile) two pipeline
+            # stages are 1.12x at n = 4096 B = 64; neutral (<= 0.02) at n <= 1024
+            lu_gemm_stages=2,
         )
     ),
 }
@@ -439,9 +494,10 @@ def _unit_lower_inv(L, bsz, fld, rolled=False):
     return X
 
 
-def _upper_inv(U, bsz, fld, rolled=False):
+def _upper_inv(U, bsz, fld):
     """Inverse of an upper-triangular bsz x bsz register tile by back substitution (zero
-    diagonal entries -> 1); ``rolled`` as in _unit_lower_inv."""
+    diagonal entries -> 1); the steps run as a lax.fori_loop (as _unit_lower_inv with
+    ``rolled``)."""
     ib = lax.broadcasted_iota(jnp.int32, (bsz, bsz), 0)
     jb = lax.broadcasted_iota(jnp.int32, (bsz, bsz), 1)
     ci = lax.broadcasted_iota(jnp.int32, (bsz,), 0)
@@ -457,11 +513,7 @@ def _upper_inv(U, bsz, fld, rolled=False):
         row = (where(ci == i, 1.0, 0.0) - acc) * recip(di)
         return where(ib == i, row[None, :], X)
 
-    if rolled:
-        return lax.fori_loop(0, bsz, lambda t, X: step(bsz - 1 - t, X), X)
-    for i in reversed(range(bsz)):
-        X = step(i, X)
-    return X
+    return lax.fori_loop(0, bsz, lambda t, X: step(bsz - 1 - t, X), X)
 
 
 def _full(n):
@@ -485,6 +537,77 @@ def _embed(A, n, pad_block, fld, b=BLOCK):
             Ap = Ap.at[:, n:, n:].set(pad_block(N - n, fld.real))
         out.append(Ap)
     return tuple(out), N // b
+
+
+def _lat_layout(m, r0, N):
+    """Latency-mode row tile of a block with m = N - r0 active rows: one power-of-2
+    tile of mp = next_pow2(m) rows as (absolute start row, height). It ends at N when
+    the matrix has room for it above r0 (the dead rows above r0 hold finished U rows
+    and are harmless to read and to rewrite unchanged); otherwise it starts at row 0
+    and overhangs N, and the kernels mask the rows past N. The tile position depends
+    only on the class mp, so blocks of one class share a kernel."""
+    mp = _next_pow2(m)
+    return ((max(N - mp, 0), mp),)
+
+
+def _lat_warps(mp, t, pf=False):
+    """Latency-mode warps for a tile of mp rows (see Tune.lat_rows_*)."""
+    if pf:
+        ladder = (t.pf_lat_rows_4w, t.pf_lat_rows_8w, t.pf_lat_rows_16w)
+    else:
+        ladder = (t.lat_rows_4w, t.lat_rows_8w, t.lat_rows_16w)
+    for limit, warps in zip(ladder, (4, 8, 16)):
+        if mp <= limit:
+            return warps
+    return 32
+
+
+def _grid_class(x):
+    """x rounded up to 3 significant bits (a multiple of 2^(bitlength - 3)): the
+    grid size of a latency-mode kernel, so that the blocks fall into a few classes
+    that share one compiled kernel while at most 1/8 of the programs are empty."""
+    if x <= 4:
+        return x
+    unit = 1 << (x.bit_length() - 3)
+    return -(-x // unit) * unit
+
+
+def _blk_spec():
+    """BlockSpec of the (1,) int32 block-offset input of a latency-mode kernel."""
+    return pl.BlockSpec((1,), lambda *idx: (0,))
+
+
+def _split_blk(r0, rest):
+    """Static r0: return it and ``rest`` unchanged. Dynamic (r0 is None): the first
+    ref of ``rest`` holds the block offset; read it (hinted as a multiple of the inner
+    width, the finest granularity of any block offset)."""
+    if r0 is not None:
+        return r0, rest
+    r0 = pl.multiple_of(rest[0][0], INNER)
+    return r0, rest[1:]
+
+
+class _Blk:
+    """The block offset of one call: ``r0`` static (an int; ``blk`` None) in the
+    throughput regime, or ``r0`` None with ``blk`` = the (1,) int32 array holding it
+    and ``m`` = the tile class the grids are sized for (latency mode: kernels differ
+    only in their operands, so XLA compiles one per class)."""
+
+    def __init__(self, r0, lat, mp):
+        self.value = r0
+        self.lat = lat
+        self.r0 = None if lat else r0
+        self.blk = jnp.full((1,), r0, jnp.int32) if lat else None
+        self.mp = mp  # rows of the panel tile (latency mode) or n - r0
+
+    def ins(self):
+        """The extra kernel input of the latency mode (appended after the regular
+        inputs, before the outputs)."""
+        return [(self.blk, _blk_spec())] if self.lat else []
+
+    def grid(self, x):
+        """A grid axis of x programs, rounded to its class in the latency mode."""
+        return _grid_class(x) if self.lat else x
 
 
 def _panel_warps(m, t, pf=False):
@@ -512,11 +635,16 @@ def _lu_block(n, t):
     their share of n (O(n^3) work) against a ~10 % gain, so the large block is used
     only when it pads at most n / 30 rows more than the small one (n = 160 padded to
     192 measured 29 % slower than 32-blocks on H200)."""
-    small, large = t.lu_block_small, t.lu_block_large
+    small, large, huge = t.lu_block_small, t.lu_block_large, t.lu_block_huge
     if n <= t.lu_block_switch or large == small:
         return small
     extra = -(-n // large) * large - (-(-n // small) * small)
-    return large if extra * 30 < n else small
+    b = large if extra * 30 < n else small
+    if n > t.lu_block_switch_huge and huge > b:
+        extra = -(-n // huge) * huge - (-(-n // b) * b)
+        if extra * 30 < n:
+            b = huge
+    return b
 
 
 def _eye_pad(m, dt):
@@ -546,6 +674,12 @@ __all__ = [
     "_tune",
     "_next_pow2",
     "_layout",
+    "_lat_layout",
+    "_lat_warps",
+    "_grid_class",
+    "_Blk",
+    "_blk_spec",
+    "_split_blk",
     "isum",
     "_argmax_chunks",
     "_unit_lower_inv",

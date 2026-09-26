@@ -54,15 +54,16 @@ from ._pf import _pf_core_factors
 
 
 # ------------------------------------------------ 32x32 unit-lower leaf inverses
-def _leaf32(L_ref, r0, fld, rolled):
+def _leaf32(L_ref, r0, fld):
     """Inverse of the unit lower-triangular 32x32 diagonal block at r0 of the packed
-    L_ref as 16x16 pieces (X10 = -X11 L10 X00)."""
+    L_ref as 16x16 pieces (X10 = -X11 L10 X00; rolled substitutions, see
+    _unit_lower_inv)."""
     s = LEAF // 2
     L00 = ld(L_ref, (pl.ds(r0, s), pl.ds(r0, s)))
     L10 = ld(L_ref, (pl.ds(r0 + s, s), pl.ds(r0, s)))
     L11 = ld(L_ref, (pl.ds(r0 + s, s), pl.ds(r0 + s, s)))
-    X00 = _unit_lower_inv(L00, s, fld, rolled)
-    X11 = _unit_lower_inv(L11, s, fld, rolled)
+    X00 = _unit_lower_inv(L00, s, fld, rolled=True)
+    X11 = _unit_lower_inv(L11, s, fld, rolled=True)
     X10 = -dot(X11, dot(L10, X00, "ieee"), "ieee")
     return X00, X10, X11
 
@@ -76,7 +77,7 @@ def _store_leaf(leaf_ref, t, X00, X10, X11, fld):
 
 
 # ------------------------------------------------------------- L assembly
-def _pf_assemble_kernel(*refs, fld, N, b, nb, rolled):
+def _pf_assemble_kernel(*refs, fld, N, b, nb, stacked):
     """Row tile i (final rows [i b, (i+1) b)) of L~ and the 32x32 leaf inverse of its
     diagonal block, from the panel buffers. Block k's pair t (local index; final
     columns r0 + 2t for its row a, r0 + 2t + 1 for p) has tau_t in gbuf_k column
@@ -86,10 +87,14 @@ def _pf_assemble_kernel(*refs, fld, N, b, nb, rolled):
         L~[f, r0 + 2t]     = -w_t[f] / d~_t     (f > r0 + 2t + 1)
         L~[f, r0 + 2t + 1] = tau_t[f]           (f > r0 + 2t + 1)
 
-    with 1/d~ (pivot K and exact zeros replaced by 1) given per pair in dinv."""
-    gbufs = refs[:nb]
-    idx_ref, dinv_ref = refs[nb], refs[nb + 1]
-    L_ref, leaf_ref = refs[nb + 2 :]
+    with 1/d~ (pivot K and exact zeros replaced by 1) given per pair in dinv. The
+    blocks' buffers come as nb separate refs (unrolled over the blocks) or, with
+    ``stacked`` (latency mode, nb up to 256), as one (nb, N, b) ref the kernel
+    loops over."""
+    ng = 1 if stacked else nb
+    gbufs = refs[:ng]
+    idx_ref, dinv_ref = refs[ng], refs[ng + 1]
+    L_ref, leaf_ref = refs[ng + 2 :]
     h2 = b // 2
     i = pl.program_id(1)
     i0 = pl.multiple_of(i * b, b)
@@ -100,10 +105,15 @@ def _pf_assemble_kernel(*refs, fld, N, b, nb, rolled):
     odd = (cb & 1) == 1
     lcol = jnp.where(odd, tcol, tcol + 4)  # tau for the p column, w for the a column
     one = fld.rscalar(1.0)
-    for k in range(nb):
+
+    def block(k, gbuf, lead=()):
+        """Block k from gbuf = its (N, b) refs, or the (nb, N, b) refs with lead =
+        (k,) (one indexer: the Triton lowering takes no chained .at[] views)."""
         r0 = k * b
+        if not isinstance(r0, int):
+            r0 = pl.multiple_of(r0, b)
         idx_all = idx_ref[pl.ds(k * N + i0, b)]
-        val = ld(gbufs[k], (idx_all[:, None], lcol[None, :]))
+        val = ld(gbuf, lead + (idx_all[:, None], lcol[None, :]))
         dinv = ld(dinv_ref, (k * h2 + half,))  # 1/d~ of each column's pair
         fac = where(odd, one, -dinv)
         colf = (r0 + cb)[None, :]
@@ -111,9 +121,20 @@ def _pf_assemble_kernel(*refs, fld, N, b, nb, rolled):
         Lt = where(below, val * fac[None, :], 0.0)
         Lt = where(rows_f == colf, 1.0, Lt)
         st(L_ref, (pl.ds(i0, b), pl.ds(r0, b)), Lt)
+
+    if stacked:
+
+        def body(k, carry):
+            block(k, gbufs[0], (k,))
+            return carry
+
+        lax.fori_loop(0, nb, body, 0)
+    else:
+        for k in range(nb):
+            block(k, gbufs[k])
     # the leaf inverse re-reads the diagonal block this program stored
     plgpu.debug_barrier()
-    _store_leaf(leaf_ref, i, *_leaf32(L_ref, i0, fld, rolled), fld)
+    _store_leaf(leaf_ref, i, *_leaf32(L_ref, i0, fld), fld)
 
 
 def _pf_maps(srcs, b, N):
@@ -191,11 +212,24 @@ def _pf_parts(S, n, fld, prec, upd_warps, adjugate):
     K = _pivot_index(d, n)
     parity = jnp.sum(jnp.concatenate(pars, axis=1), axis=1) % 2
     sgnP = jnp.where(parity == 1, -1.0, 1.0).astype(fld.dtype)
+    lat = n > t.latency_min_n  # as in _pf_run
     gspec = pl.BlockSpec((None, N, b), lambda bi, i: (bi, 0, 0))
     leaf_spec = pl.BlockSpec((None, nb, LEAF, LEAF), lambda bi, i: (bi, 0, 0, 0))
     kern = functools.partial(
-        _pf_assemble_kernel, fld=fld, N=N, b=b, nb=nb, rolled=t.diag_rolled
+        _pf_assemble_kernel,
+        fld=fld,
+        N=N,
+        b=b,
+        nb=nb,
+        stacked=lat,
     )
+    if lat:
+        # one (B, nb, N, b) buffer the assembly kernel loops over (one N x N copy)
+        stack = tuple(jnp.stack([g[c] for g in gbufs], axis=1) for c in range(fld.k))
+        gspec = pl.BlockSpec((None, nb, N, b), lambda bi, i: (bi, 0, 0, 0))
+        g_ins = [(stack, gspec)]
+    else:
+        g_ins = [(g, gspec) for g in gbufs]
     at0 = dict(ra=0, ca=0, rb=0, cb=0, rc=0, cc=0)
     dims = dict(M=N, Nn=N, K=N, prec=prec, fld=fld)
 
@@ -203,20 +237,21 @@ def _pf_parts(S, n, fld, prec, upd_warps, adjugate):
         """The formula for the pivots dd (d, or d with a second zero lifted)."""
         dt_ = _pair_scale(dd, K)  # d~: pivot K and exact zeros -> 1
         dinv = fld.split(1 / dt_)
-        ins = [(g, gspec) for g in gbufs] + [(idx, _vec(nb * N)), (dinv, _vec(h))]
+        ins = g_ins + [(idx, _vec(nb * N)), (dinv, _vec(h))]
         outs = [
             (fld.structs((B, N, N)), _full(N)),
             (fld.structs((B, nb, LEAF, LEAF)), leaf_spec),
         ]
         L, Lleaf = _pcall(kern, ins, outs, (B, nb), num_warps=t.diag_warps)
-        Y = _inv_unit_lower(L, Lleaf, prec, fld)  # L~^-1
+        Y = _inv_unit_lower(L, Lleaf, prec, fld, dyn=lat)  # L~^-1
         Yj = fld.join(Y)
         # D~^-1 Y: the rows of each pair (a, p) -> (Y[p], -Y[a]) / d~
         Yr = Yj.reshape(B, h, 2, N)
         DY = jnp.stack([Yr[:, :, 1], -Yr[:, :, 0]], axis=2) / dt_[:, :, None, None]
         DY = fld.split(DY.reshape(B, N, N))
-        # R = Y^T D~^-1 Y is skew: lower tiles + mirror when the table says so
-        R = _bgemm((Y, DY), 0, 1, None, ta=True, skew=t.pf_skew_r, **at0, **dims)
+        # R = Y^T D~^-1 Y is skew: the tiles on and below the diagonal + their mirror
+        # (half the GEMM work; measured 0.91x of the pf backward at n = 512)
+        R = _bgemm((Y, DY), 0, 1, None, ta=True, skew=True, **at0, **dims)
         # w = R e_{a_K}, v = Y^T e_{a_K} (a_K = 2K); the assembly of
         # -(a1 R + a2 (w v^T - v w^T)) is fused with the permutation scatter
         a1, a2, _ = _pf_adj_coeffs(dd, sgnP, K, adjugate)
